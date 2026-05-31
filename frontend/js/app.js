@@ -1,39 +1,26 @@
 // vstunnel Mobile UI - Application Logic
-// Supports relay mode (corporate) and direct mode (standalone).
-// HTTP-first connection with WebSocket upgrade and HTTP polling fallback.
+// Supports multi-instance workspace selection and prompt history
 
 class VSTunnelClient {
     constructor() {
         this.websocket = null;
-        this.serverUrl = localStorage.getItem('tunnelUrl') || '';
-        this.authToken = localStorage.getItem('authToken') || '';
-        this.targetUser = localStorage.getItem('targetUser') || '';
+        this.tunnelUrl = localStorage.getItem('tunnelUrl') || '';
         this.isConnected = false;
         this.selectedWorkspace = null;
         this.workspaces = [];
-        this.transport = null;
-        this.sessionId = null;
-        this.pollTimer = null;
-        this.pollInterval = 2000;
-        this.isRelay = false;
         this.init();
     }
 
     init() {
         this.cacheDOM();
         this.attachEventListeners();
-        this.restoreUrl();
+        this.restoreTunnelUrl();
     }
 
     cacheDOM() {
         this.setupPanel = document.getElementById('setupPanel');
         this.tunnelUrlInput = document.getElementById('tunnelUrl');
         this.connectBtn = document.getElementById('connectBtn');
-
-        this.userPanel = document.getElementById('userPanel');
-        this.userList = document.getElementById('userList');
-        this.authTokenInput = document.getElementById('authToken');
-        this.refreshUsersBtn = document.getElementById('refreshUsersBtn');
 
         this.workspacePanel = document.getElementById('workspacePanel');
         this.workspaceList = document.getElementById('workspaceList');
@@ -70,7 +57,6 @@ class VSTunnelClient {
             if (e.key === 'Enter') this.connect();
         });
 
-        this.refreshUsersBtn.addEventListener('click', () => this.fetchUsers());
         this.refreshWorkspacesBtn.addEventListener('click', () => this.requestWorkspaces());
         this.changeWorkspaceBtn.addEventListener('click', () => this.showWorkspaceSelector());
 
@@ -87,346 +73,73 @@ class VSTunnelClient {
         this.errorCloseBtn.addEventListener('click', () => this.hideError());
     }
 
-    restoreUrl() {
-        if (this.serverUrl) this.tunnelUrlInput.value = this.serverUrl;
-        if (this.authToken) this.authTokenInput.value = this.authToken;
+    restoreTunnelUrl() {
+        if (this.tunnelUrl) {
+            this.tunnelUrlInput.value = this.tunnelUrl;
+        }
     }
 
     // ─── Connection ─────────────────────────────────────────────────────
 
-    normalizeUrl(input) {
-        let url = input.trim();
-        if (!url.startsWith('http://') && !url.startsWith('https://')) {
-            url = `https://${url}`;
-        }
-        return url.replace(/\/+$/, '');
-    }
-
-    async connect() {
-        const rawUrl = this.tunnelUrlInput.value.trim();
-        if (!rawUrl) {
-            this.showError('Please enter a server URL');
+    connect() {
+        const tunnelUrl = this.tunnelUrlInput.value.trim();
+        if (!tunnelUrl) {
+            this.showError('Please enter a VS Code tunnel URL');
             return;
         }
-        if (this.isConnected) {
+        if (this.websocket && this.isConnected) {
             this.showError('Already connected. Disconnect first.');
             return;
         }
+        this.connectToWebSocket(tunnelUrl);
+    }
 
-        this.serverUrl = this.normalizeUrl(rawUrl);
-        this.log('Connecting...', 'info');
-        this.connectBtn.disabled = true;
-
+    connectToWebSocket(tunnelUrl) {
         try {
-            const healthResp = await fetch(`${this.serverUrl}/health`);
-            if (!healthResp.ok) throw new Error(`Server returned ${healthResp.status}`);
-            const health = await healthResp.json();
-            this.log(`Server healthy (v${health.version})`, 'info');
-
-            this.isRelay = health.registered_laptops !== undefined;
-        } catch (err) {
-            this.connectBtn.disabled = false;
-            this.showError(`Cannot reach server: ${err.message}`);
-            return;
-        }
-
-        localStorage.setItem('tunnelUrl', rawUrl);
-        this.connectBtn.disabled = false;
-
-        if (this.isRelay) {
-            this.log('Relay server detected', 'info');
-            this.setupPanel.style.display = 'none';
-            this.userPanel.style.display = 'block';
-            await this.fetchUsers();
-        } else {
-            this.setupPanel.style.display = 'none';
-            await this.connectDirect();
-        }
-    }
-
-    // ─── Relay Mode: User Selection ─────────────────────────────────────
-
-    async fetchUsers() {
-        try {
-            const resp = await fetch(`${this.serverUrl}/api/users`);
-            if (!resp.ok) throw new Error(`${resp.status}`);
-            const data = await resp.json();
-            this.renderUserList(data.users || []);
-        } catch (err) {
-            this.log(`Failed to fetch users: ${err.message}`, 'error');
-        }
-    }
-
-    renderUserList(users) {
-        if (users.length === 0) {
-            this.userList.innerHTML = `
-                <div class="workspace-empty">
-                    <p>No laptops registered.</p>
-                    <p class="small">Make sure your daemon is running with RELAY_URL set.</p>
-                </div>
-            `;
-            return;
-        }
-
-        this.userList.innerHTML = '';
-        users.forEach((user) => {
-            const card = document.createElement('div');
-            card.className = 'workspace-card';
-            if (this.targetUser === user.user_id) card.classList.add('selected');
-
-            const wsCount = (user.workspaces || []).length;
-            const wsLabel = wsCount === 1 ? '1 workspace' : `${wsCount} workspaces`;
-
-            card.innerHTML = `
-                <div class="workspace-card-header">
-                    <span class="workspace-icon">${user.online ? '🟢' : '🔴'}</span>
-                    <span class="workspace-card-name">${this.escapeHtml(user.user_id)}</span>
-                    <span class="pid-badge">${wsLabel}</span>
-                </div>
-                <div class="workspace-card-path">${user.online ? 'Online' : 'Offline'}</div>
-            `;
-
-            card.addEventListener('click', () => {
-                if (!user.online) {
-                    this.showError('This laptop is offline');
-                    return;
-                }
-                this.selectUser(user);
-            });
-
-            this.userList.appendChild(card);
-        });
-    }
-
-    async selectUser(user) {
-        const token = this.authTokenInput.value.trim();
-        if (!token) {
-            this.showError('Please enter the auth token from your daemon terminal');
-            return;
-        }
-
-        this.targetUser = user.user_id;
-        this.authToken = token;
-        localStorage.setItem('targetUser', this.targetUser);
-        localStorage.setItem('authToken', this.authToken);
-
-        this.log(`Connecting to ${user.user_id}...`, 'info');
-
-        const wsConnected = await this.tryWebSocketRelay();
-        if (wsConnected) {
-            this.transport = 'websocket';
-            this.log('Transport: WebSocket', 'info');
-        } else {
-            this.log('WebSocket blocked, using HTTP polling...', 'info');
-            const pollOk = await this.startPollingRelay();
-            if (!pollOk) {
-                this.showError('Failed to connect. Check token and try again.');
-                return;
+            let wsUrl = tunnelUrl;
+            if (!wsUrl.startsWith('wss://') && !wsUrl.startsWith('ws://')) {
+                wsUrl = wsUrl.replace(/^https?:\/\//, '');
+                wsUrl = `wss://${wsUrl}`;
             }
-            this.transport = 'polling';
-            this.log('Transport: HTTP polling', 'info');
-        }
 
+            this.log('Connecting...', 'info');
+            this.websocket = new WebSocket(wsUrl);
+            this.websocket.onopen = () => this.onConnected(tunnelUrl);
+            this.websocket.onmessage = (event) => this.onMessage(event);
+            this.websocket.onerror = () => this.onError();
+            this.websocket.onclose = () => this.onDisconnected();
+        } catch (error) {
+            this.showError(`Connection error: ${error.message}`);
+        }
+    }
+
+    onConnected(tunnelUrl) {
         this.isConnected = true;
-        this.userPanel.style.display = 'none';
+        localStorage.setItem('tunnelUrl', tunnelUrl);
+        this.setupPanel.style.display = 'none';
         this.updateStatusBadge('CONNECTED');
+        this.log('Connected to daemon', 'success');
     }
-
-    tryWebSocketRelay() {
-        return new Promise((resolve) => {
-            try {
-                let wsUrl = this.serverUrl
-                    .replace(/^https:\/\//, 'wss://')
-                    .replace(/^http:\/\//, 'ws://');
-                wsUrl += '/ws/phone';
-
-                const ws = new WebSocket(wsUrl);
-                const timeout = setTimeout(() => { ws.close(); resolve(false); }, 5000);
-
-                ws.onopen = () => {
-                    clearTimeout(timeout);
-                    ws.send(JSON.stringify({
-                        type: 'CONNECT_TO',
-                        user_id: this.targetUser,
-                        token: this.authToken,
-                    }));
-                };
-
-                ws.onmessage = (event) => {
-                    const data = JSON.parse(event.data);
-                    if (data.type === 'WELCOME') {
-                        this.websocket = ws;
-                        this.websocket.onmessage = (ev) => this.onMessage(ev);
-                        this.websocket.onclose = () => this.onDisconnected();
-                        this.websocket.onerror = () => {};
-                        this.handleWelcome(data);
-                        resolve(true);
-                    } else if (data.type === 'ERROR') {
-                        clearTimeout(timeout);
-                        ws.close();
-                        this.log(`Auth failed: ${data.message}`, 'error');
-                        resolve(false);
-                    }
-                };
-
-                ws.onerror = () => { clearTimeout(timeout); resolve(false); };
-            } catch (e) {
-                resolve(false);
-            }
-        });
-    }
-
-    async startPollingRelay() {
-        try {
-            const resp = await fetch(
-                `${this.serverUrl}/api/connect?user=${encodeURIComponent(this.targetUser)}&token=${encodeURIComponent(this.authToken)}`
-            );
-            if (!resp.ok) {
-                const err = await resp.json().catch(() => ({}));
-                this.log(err.message || `Connect failed (${resp.status})`, 'error');
-                return false;
-            }
-            const data = await resp.json();
-            this.sessionId = data.session_id;
-            this.pollInterval = data.poll_interval_ms || 2000;
-            this.handleWelcome(data);
-            this.schedulePoll();
-            return true;
-        } catch (err) {
-            return false;
-        }
-    }
-
-    // ─── Direct Mode ────────────────────────────────────────────────────
-
-    async connectDirect() {
-        const wsConnected = await this.tryWebSocketDirect();
-        if (wsConnected) {
-            this.transport = 'websocket';
-            this.log('Transport: WebSocket', 'info');
-        } else {
-            this.log('WebSocket blocked, using HTTP polling...', 'info');
-            const pollOk = await this.startPollingDirect();
-            if (!pollOk) {
-                this.showError('Failed to establish connection');
-                this.setupPanel.style.display = 'block';
-                return;
-            }
-            this.transport = 'polling';
-            this.log('Transport: HTTP polling', 'info');
-        }
-
-        this.isConnected = true;
-        this.updateStatusBadge('CONNECTED');
-    }
-
-    tryWebSocketDirect() {
-        return new Promise((resolve) => {
-            try {
-                let wsUrl = this.serverUrl
-                    .replace(/^https:\/\//, 'wss://')
-                    .replace(/^http:\/\//, 'ws://');
-                wsUrl += '/ws';
-
-                const ws = new WebSocket(wsUrl);
-                const timeout = setTimeout(() => { ws.close(); resolve(false); }, 5000);
-
-                ws.onopen = () => {
-                    clearTimeout(timeout);
-                    this.websocket = ws;
-                    this.websocket.onmessage = (ev) => this.onMessage(ev);
-                    this.websocket.onclose = () => this.onDisconnected();
-                    this.websocket.onerror = () => {};
-                    resolve(true);
-                };
-
-                ws.onerror = () => { clearTimeout(timeout); resolve(false); };
-            } catch (e) {
-                resolve(false);
-            }
-        });
-    }
-
-    async startPollingDirect() {
-        try {
-            const resp = await fetch(`${this.serverUrl}/api/connect`);
-            if (!resp.ok) return false;
-            const data = await resp.json();
-            this.sessionId = data.session_id;
-            this.pollInterval = data.poll_interval_ms || 2000;
-            this.handleWelcome(data);
-            this.schedulePoll();
-            return true;
-        } catch (err) {
-            return false;
-        }
-    }
-
-    // ─── Polling ────────────────────────────────────────────────────────
-
-    schedulePoll() {
-        if (this.pollTimer) clearTimeout(this.pollTimer);
-        this.pollTimer = setTimeout(() => this.poll(), this.pollInterval);
-    }
-
-    async poll() {
-        if (!this.isConnected || this.transport !== 'polling') return;
-
-        try {
-            const resp = await fetch(`${this.serverUrl}/api/poll?session=${this.sessionId}`, {
-                headers: { 'X-Session-Id': this.sessionId },
-            });
-
-            if (resp.status === 401) {
-                this.log('Session expired, reconnecting...', 'error');
-                this.disconnect();
-                return;
-            }
-
-            if (resp.ok) {
-                const data = await resp.json();
-                if (data.messages) {
-                    data.messages.forEach(msg => this.handleMessage(msg));
-                }
-            }
-        } catch (err) {
-            this.log('Poll failed, retrying...', 'error');
-        }
-
-        this.schedulePoll();
-    }
-
-    // ─── Connection Lifecycle ───────────────────────────────────────────
 
     onDisconnected() {
         this.isConnected = false;
-        this.transport = null;
-        this.sessionId = null;
         this.selectedWorkspace = null;
         this.workspaces = [];
-        if (this.pollTimer) { clearTimeout(this.pollTimer); this.pollTimer = null; }
         this.setupPanel.style.display = 'block';
-        this.userPanel.style.display = 'none';
         this.workspacePanel.style.display = 'none';
         this.controlPanel.style.display = 'none';
         this.updateStatusBadge('DISCONNECTED');
         this.log('Disconnected', 'error');
     }
 
+    onError() {
+        this.showError('Connection failed. Check tunnel URL and try again.');
+    }
+
     disconnect() {
-        if (this.websocket) { this.websocket.close(); this.websocket = null; }
-        if (this.pollTimer) { clearTimeout(this.pollTimer); this.pollTimer = null; }
-        this.isConnected = false;
-        this.transport = null;
-        this.sessionId = null;
-        this.selectedWorkspace = null;
-        this.workspaces = [];
-        this.setupPanel.style.display = 'block';
-        this.userPanel.style.display = 'none';
-        this.workspacePanel.style.display = 'none';
-        this.controlPanel.style.display = 'none';
-        this.updateStatusBadge('DISCONNECTED');
-        this.log('Disconnected', 'info');
+        if (this.websocket) {
+            this.websocket.close();
+        }
     }
 
     // ─── Message Handling ───────────────────────────────────────────────
@@ -434,48 +147,37 @@ class VSTunnelClient {
     onMessage(event) {
         try {
             const data = JSON.parse(event.data);
-            this.handleMessage(data);
+            switch (data.type) {
+                case 'WELCOME':
+                    this.handleWelcome(data);
+                    break;
+                case 'STATUS_UPDATE':
+                    this.handleStatusUpdate(data);
+                    break;
+                case 'PROMPT_ACK':
+                    this.handlePromptAck(data);
+                    break;
+                case 'WORKSPACES':
+                    this.handleWorkspaceList(data);
+                    break;
+                case 'HISTORY_RESPONSE':
+                    this.handleHistory(data);
+                    break;
+                case 'ERROR':
+                    this.log(`Server error: ${data.message}`, 'error');
+                    break;
+                case 'PONG':
+                    break;
+            }
         } catch (error) {
             console.error('Message parse error:', error);
         }
     }
 
-    handleMessage(data) {
-        switch (data.type) {
-            case 'WELCOME':
-                this.handleWelcome(data);
-                break;
-            case 'STATUS_UPDATE':
-                this.handleStatusUpdate(data);
-                break;
-            case 'PROMPT_ACK':
-                this.handlePromptAck(data);
-                break;
-            case 'WORKSPACES':
-                this.handleWorkspaceList(data);
-                break;
-            case 'HISTORY_RESPONSE':
-                this.handleHistory(data);
-                break;
-            case 'RESPONSE':
-                if (data.result) this.handlePromptAck(data);
-                else if (data.workspaces) this.handleWorkspaceList(data);
-                else if (data.history) this.handleHistory(data);
-                break;
-            case 'ERROR':
-                this.log(`Server error: ${data.message}`, 'error');
-                break;
-        }
-    }
-
     handleWelcome(data) {
-        const version = data.version || '?';
-        const os = data.os || '';
-        const userId = data.user_id || '';
-        const extra = userId ? ` (${userId})` : (os ? ` on ${os}` : '');
-        this.log(`Connected v${version}${extra}`, 'info');
+        this.log(`Daemon v${data.version} on ${data.os}`, 'info');
 
-        if (data.vscode_available === false) {
+        if (!data.vscode_available) {
             this.log('Warning: VS Code CLI not detected on host', 'error');
         }
 
@@ -484,9 +186,9 @@ class VSTunnelClient {
     }
 
     handleStatusUpdate(data) {
-        if (data.os) this.osInfo.textContent = data.os;
-        if (data.version) this.versionInfo.textContent = data.version;
-        if (data.uptime !== undefined) this.uptimeInfo.textContent = this.formatUptime(data.uptime);
+        this.osInfo.textContent = data.os || '—';
+        this.versionInfo.textContent = data.version || '—';
+        this.uptimeInfo.textContent = this.formatUptime(data.uptime);
 
         if (data.workspaces && data.workspaces.length !== this.workspaces.length) {
             this.workspaces = data.workspaces;
@@ -494,18 +196,14 @@ class VSTunnelClient {
                 this.renderWorkspaceList();
             }
         }
-
-        if (data.online === false) {
-            this.log('Laptop went offline', 'error');
-        }
     }
 
     handlePromptAck(data) {
         const ws = data.workspace ? ` [${data.workspace}]` : '';
-        if (data.result && data.result.status === 'SUCCESS') {
+        if (data.result.status === 'SUCCESS') {
             this.log(`Prompt executed${ws}`, 'success');
             this.promptInput.value = '';
-        } else if (data.result) {
+        } else {
             this.log(`Failed${ws}: ${data.result.message}`, 'error');
         }
     }
@@ -580,6 +278,7 @@ class VSTunnelClient {
 
         this.workspaceList.innerHTML = '';
 
+        // "Any / Default" option
         const defaultCard = this.createWorkspaceCard({
             id: null,
             name: 'Default (any instance)',
@@ -587,6 +286,7 @@ class VSTunnelClient {
         }, true);
         this.workspaceList.appendChild(defaultCard);
 
+        // Detected workspaces
         this.workspaces.forEach((ws) => {
             const card = this.createWorkspaceCard(ws, false);
             this.workspaceList.appendChild(card);
@@ -600,15 +300,17 @@ class VSTunnelClient {
             card.classList.add('selected');
         }
 
+        const name = workspace.name;
+        const path = isDefault ? workspace.folder_path : workspace.folder_path;
         const pidBadge = workspace.pid ? `<span class="pid-badge">PID ${workspace.pid}</span>` : '';
 
         card.innerHTML = `
             <div class="workspace-card-header">
                 <span class="workspace-icon">${isDefault ? '🔀' : '📂'}</span>
-                <span class="workspace-card-name">${this.escapeHtml(workspace.name)}</span>
+                <span class="workspace-card-name">${this.escapeHtml(name)}</span>
                 ${pidBadge}
             </div>
-            <div class="workspace-card-path">${this.escapeHtml(workspace.folder_path)}</div>
+            <div class="workspace-card-path">${this.escapeHtml(path)}</div>
         `;
 
         card.addEventListener('click', () => {
@@ -644,8 +346,14 @@ class VSTunnelClient {
 
     sendPrompt() {
         const prompt = this.promptInput.value.trim();
-        if (!prompt) { this.showError('Please enter a prompt'); return; }
-        if (!this.isConnected) { this.showError('Not connected'); return; }
+        if (!prompt) {
+            this.showError('Please enter a prompt');
+            return;
+        }
+        if (!this.isConnected) {
+            this.showError('Not connected to daemon');
+            return;
+        }
 
         const message = {
             type: 'PROMPT',
@@ -667,32 +375,13 @@ class VSTunnelClient {
         this.send({ type: 'HISTORY' });
     }
 
-    // ─── Transport-Agnostic Send ────────────────────────────────────────
+    // ─── Utilities ──────────────────────────────────────────────────────
 
-    async send(data) {
-        if (this.transport === 'websocket' && this.websocket && this.websocket.readyState === WebSocket.OPEN) {
+    send(data) {
+        if (this.websocket && this.websocket.readyState === WebSocket.OPEN) {
             this.websocket.send(JSON.stringify(data));
-        } else if (this.transport === 'polling' && this.sessionId) {
-            try {
-                const resp = await fetch(`${this.serverUrl}/api/send`, {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'X-Session-Id': this.sessionId,
-                    },
-                    body: JSON.stringify(data),
-                });
-                if (resp.ok) {
-                    const result = await resp.json();
-                    this.handleMessage(result);
-                }
-            } catch (err) {
-                this.log('Send failed: ' + err.message, 'error');
-            }
         }
     }
-
-    // ─── Utilities ──────────────────────────────────────────────────────
 
     updateStatusBadge(status) {
         const connected = status === 'CONNECTED';
@@ -703,10 +392,13 @@ class VSTunnelClient {
     log(message, type = 'info') {
         const entry = document.createElement('div');
         entry.className = `log-entry ${type}`;
+
         const time = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
         entry.innerHTML = `<span class="log-time">${time}</span> ${this.escapeHtml(message)}`;
+
         this.activityLog.appendChild(entry);
         this.activityLog.scrollTop = this.activityLog.scrollHeight;
+
         while (this.activityLog.children.length > 100) {
             this.activityLog.removeChild(this.activityLog.firstChild);
         }
@@ -718,12 +410,17 @@ class VSTunnelClient {
         setTimeout(() => this.hideError(), 5000);
     }
 
-    hideError() { this.errorPanel.style.display = 'none'; }
+    hideError() {
+        this.errorPanel.style.display = 'none';
+    }
 
     formatTime(timestamp) {
         if (!timestamp) return '—';
-        try { return new Date(timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }); }
-        catch { return '—'; }
+        try {
+            return new Date(timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        } catch {
+            return '—';
+        }
     }
 
     formatUptime(seconds) {

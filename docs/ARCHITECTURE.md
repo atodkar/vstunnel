@@ -77,40 +77,38 @@ class VSTunnelClient {
 
 #### Connection Flow:
 ```
-User Input → Validate URL → Fetch /health (HTTP) → Try WebSocket /ws
-                                                     ↓ (if WS blocked)
-                                              Fall back to HTTP polling
-                                              (/api/connect → /api/poll → /api/send)
+User Input → Validate URL → Transform to WSS → New WebSocket()
+                                                     ↓
+                                              onopen: Update UI
+                                              onmessage: Process data
+                                              onerror: Show error
+                                              onclose: Reset state
 ```
 
 ### 2. Backend - Python Daemon
 
 **Technology**: Python 3.8+ with async/await
-**Libraries**: `aiohttp` (HTTP + WebSocket server with HTTP polling fallback)
+**Libraries**: `websockets` (pure Python, no C extensions)
 
 #### Architecture:
 
 ```python
 main()
-  ├── Start aiohttp server (HTTP + WebSocket on same port)
+  ├── Start WebSocket server
   │   └── listen on localhost:8080
-  ├── HTTP endpoints:
-  │   ├── GET /health → health check
-  │   ├── GET /api/connect → create polling session
-  │   ├── GET /api/poll → receive queued messages
-  │   ├── POST /api/send → send commands via HTTP
-  │   └── GET /* → serve frontend static files
-  ├── WebSocket endpoint:
-  │   └── GET /ws → handle_websocket(request)
-  │       ├── Add socket to connected_clients set
-  │       ├── Start async status streaming task
-  │       ├── Process incoming messages loop
-  │       │   ├── JSON parse message
-  │       │   ├── Route by type
-  │       │   │   ├── PROMPT → execute_vscode_command()
-  │       │   │   └── PING → Send PONG
-  │       │   └── Send ACK back to client
-  │       └── Cleanup on disconnect
+  ├── Await connections indefinitely
+  │   ├── handle_connection(websocket, path)
+  │   │   ├── Add socket to CONNECTED_PHONES set
+  │   │   ├── Start async status_task
+  │   │   ├── Process incoming messages loop
+  │   │   │   ├── JSON parse message
+  │   │   │   ├── Route by type
+  │   │   │   │   ├── PROMPT → execute_vscode_command()
+  │   │   │   │   └── PING → Send PONG
+  │   │   │   └── Send ACK back to client
+  │   │   └── Cleanup on disconnect
+  │   └── stream_status(websocket)
+  │       └── Every 2s: Send STATUS_UPDATE packet
 ```
 
 #### Message Protocol:
