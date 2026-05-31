@@ -1,0 +1,116 @@
+{
+  "name": "vstunnel",
+  "displayName": "vstunnel - Mobile Copilot Bridge",
+  "description": "Control GitHub Copilot from your phone. Send prompts, monitor status, and approve actions remotely.",
+  "version": "1.0.0",
+  "publisher": "vstunnel",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other",
+    "AI"
+  ],
+  "keywords": [
+    "copilot",
+    "mobile",
+    "remote",
+    "tunnel",
+    "ai"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "vstunnel.start",
+        "title": "vstunnel: Start Mobile Bridge"
+      },
+      {
+        "command": "vstunnel.stop",
+        "title": "vstunnel: Stop Mobile Bridge"
+      },
+      {
+        "command": "vstunnel.showQR",
+        "title": "vstunnel: Show Connection QR Code"
+      },
+      {
+        "command": "vstunnel.status",
+        "title": "vstunnel: Show Connection Status"
+      }
+    ],
+    "configuration": {
+      "title": "vstunnel",
+      "properties": {
+        "vstunnel.port": {
+          "type": "number",
+          "default": 8080,
+          "description": "Local port for the WebSocket server"
+        },
+        "vstunnel.autoStart": {
+          "type": "boolean",
+          "default": false,
+          "description": "Automatically start the bridge when VS Code opens"
+        },
+        "vstunnel.autoForward": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically forward the port via VS Code tunnels"
+        },
+        "vstunnel.requireToken": {
+          "type": "boolean",
+          "default": true,
+          "description": "Require authentication token for mobile connections"
+        }
+      }
+    },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "vstunnel",
+          "title": "vstunnel",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "vstunnel": [
+        {
+          "id": "vstunnel.status",
+          "name": "Connection Status"
+        },
+        {
+          "id": "vstunnel.history",
+          "name": "Prompt History"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "lint": "eslint src --ext ts",
+    "package": "vsce package",
+    "publish": "vsce publish"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "@types/ws": "^8.5.0",
+    "@vscode/vsce": "^2.22.0",
+    "eslint": "^8.50.0",
+    "typescript": "^5.3.0"
+  },
+  "dependencies": {
+    "ws": "^8.16.0",
+    "qrcode": "^1.5.3"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/atodkar/vstunnel.git"
+  }
+}

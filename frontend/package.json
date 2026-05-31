@@ -1,0 +1,24 @@
+{
+  "name": "vstunnel-frontend",
+  "version": "1.1.0",
+  "description": "Mobile Copilot Bridge - Frontend UI",
+  "private": false,
+  "license": "MIT",
+  "scripts": {
+    "serve": "npx serve . -l 3000",
+    "deploy:vercel": "vercel deploy --prod",
+    "deploy:pages": "echo 'Push to gh-pages branch or enable GitHub Pages on main/docs'"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/atodkar/vstunnel.git",
+    "directory": "frontend"
+  },
+  "keywords": [
+    "copilot",
+    "mobile",
+    "remote-control",
+    "vscode",
+    "websocket"
+  ]
+}

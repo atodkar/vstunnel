@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="vstunnel - Mobile Copilot Bridge for GitHub Copilot">
+    <title>vstunnel - Mobile Copilot</title>
+    <link rel="stylesheet" href="css/styles.css">
+</head>
+<body>
+    <div id="app" class="container">
+        <!-- Header -->
+        <header class="header">
+            <div class="logo">
+                <span class="icon">🚀</span>
+                <h1>vstunnel</h1>
+            </div>
+            <div class="status-badge" id="statusBadge">
+                <span class="status-dot" id="statusDot"></span>
+                <span id="statusText">Disconnected</span>
+            </div>
+        </header>
+
+        <!-- Connection Setup Panel -->
+        <section id="setupPanel" class="panel setup-panel">
+            <h2>Connection Setup</h2>
+            <div class="form-group">
+                <label for="tunnelUrl">VS Code Tunnel URL:</label>
+                <input
+                    type="text"
+                    id="tunnelUrl"
+                    placeholder="e.g., xk7abc123-8080.use2.devtunnels.ms"
+                    class="input-field"
+                >
+                <small>Get this from VS Code Ports panel</small>
+            </div>
+            <button id="connectBtn" class="btn btn-primary">
+                Connect to Daemon
+            </button>
+        </section>
+
+        <!-- Workspace Selector (shown after connect, before control panel) -->
+        <section id="workspacePanel" class="panel workspace-panel" style="display: none;">
+            <h2>Select VS Code Instance</h2>
+            <p class="panel-description">Multiple VS Code windows detected. Choose which workspace to send prompts to:</p>
+
+            <div id="workspaceList" class="workspace-list">
+                <!-- Populated dynamically -->
+            </div>
+
+            <div class="workspace-actions">
+                <button id="refreshWorkspacesBtn" class="btn btn-secondary">
+                    Refresh List
+                </button>
+            </div>
+        </section>
+
+        <!-- Main Control Panel (shown after workspace selection) -->
+        <section id="controlPanel" class="panel control-panel" style="display: none;">
+            <!-- Active Workspace Indicator -->
+            <div class="active-workspace" id="activeWorkspace">
+                <span class="workspace-label">Target:</span>
+                <span class="workspace-name" id="activeWorkspaceName">Default (single instance)</span>
+                <button id="changeWorkspaceBtn" class="btn-link">Change</button>
+            </div>
+
+            <!-- Status Display -->
+            <div class="status-display">
+                <div class="stat-item">
+                    <span class="stat-label">OS:</span>
+                    <span id="osInfo" class="stat-value">—</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-label">Version:</span>
+                    <span id="versionInfo" class="stat-value">—</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-label">Uptime:</span>
+                    <span id="uptimeInfo" class="stat-value">—</span>
+                </div>
+            </div>
+
+            <!-- Prompt Input Section -->
+            <div class="prompt-section">
+                <h2>Send Prompt to Copilot</h2>
+                <textarea
+                    id="promptInput"
+                    placeholder="Type your prompt here... (e.g., 'Fix the failing test in auth.test.ts')"
+                    class="textarea-field"
+                ></textarea>
+                <div class="button-group">
+                    <button id="sendBtn" class="btn btn-success">
+                        📤 Send Prompt
+                    </button>
+                    <button id="clearBtn" class="btn btn-secondary">
+                        Clear
+                    </button>
+                </div>
+            </div>
+
+            <!-- Prompt History Section -->
+            <div class="history-section">
+                <div class="section-header">
+                    <h3>Prompt History</h3>
+                    <button id="loadHistoryBtn" class="btn-link">Load History</button>
+                </div>
+                <div id="historyList" class="history-list">
+                    <p class="empty-state">No prompts sent yet</p>
+                </div>
+            </div>
+
+            <!-- Activity Log -->
+            <div class="activity-section">
+                <div class="section-header">
+                    <h3>Live Activity</h3>
+                    <button id="clearLogBtn" class="btn-link">Clear</button>
+                </div>
+                <div id="activityLog" class="activity-log">
+                    <!-- Populated dynamically -->
+                </div>
+            </div>
+
+            <!-- Disconnect Button -->
+            <button id="disconnectBtn" class="btn btn-danger">
+                🔌 Disconnect
+            </button>
+        </section>
+
+        <!-- Error Panel -->
+        <div id="errorPanel" class="panel error-panel" style="display: none;">
+            <h3>⚠️ Error</h3>
+            <p id="errorMessage"></p>
+            <button id="errorCloseBtn" class="btn btn-secondary">
+                Dismiss
+            </button>
+        </div>
+    </div>
+
+    <script src="js/app.js"></script>
+</body>
+</html>
