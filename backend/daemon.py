@@ -414,7 +414,11 @@ async def execute_vscode_command(prompt: str, workspace_folder: str = None) -> d
         }
 
     try:
-        cmd = ["code"]
+        cmd = []
+        if platform.system() == "Windows":
+            cmd = ["cmd", "/c", "code"]
+        else:
+            cmd = ["code"]
 
         if workspace_folder:
             folder_uri = workspace_folder
