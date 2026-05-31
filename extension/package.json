@@ -47,7 +47,7 @@
       "properties": {
         "vstunnel.port": {
           "type": "number",
-          "default": 8080,
+          "default": 8100,
           "description": "Local port for the WebSocket server"
         },
         "vstunnel.autoStart": {
@@ -68,7 +68,7 @@
         "vstunnel.relayUrl": {
           "type": "string",
           "default": "",
-          "description": "Relay server URL (e.g., http://vstunnel.siemens.internal:8080). When set, connects outbound to relay instead of requiring port forwarding."
+          "description": "Relay server URL (e.g., http://vstunnel.siemens.internal:8100). When set, connects outbound to relay instead of requiring port forwarding."
         },
         "vstunnel.userId": {
           "type": "string",

@@ -901,7 +901,7 @@ async def _periodic_workspace_update(ws):
 
 
 async def main():
-    port = int(os.getenv("DAEMON_PORT", "8080"))
+    port = int(os.getenv("DAEMON_PORT", "8100"))
     host = os.getenv("DAEMON_HOST", "localhost")
     relay_url = os.getenv("RELAY_URL", "").strip()
     user_id = os.getenv("RELAY_USER_ID", "").strip() or os.getenv("USER", "").strip() or "developer"

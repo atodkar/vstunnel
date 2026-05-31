@@ -8,14 +8,14 @@ services:
     container_name: vstunnel-relay
     restart: unless-stopped
     ports:
-      - "${RELAY_PORT:-8080}:8080"
+      - "${RELAY_PORT:-8100}:8100"
     environment:
-      - RELAY_PORT=8080
+      - RELAY_PORT=8100
       - RELAY_HOST=0.0.0.0
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - ADMIN_TOKEN=${ADMIN_TOKEN:-}
     healthcheck:
-      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8100/health')"]
       interval: 30s
       timeout: 5s
       retries: 3

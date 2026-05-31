@@ -49,3 +49,4 @@ yarn-error.log*
 # Distribution
 *.tar.gz
 *.zip
+extension/out/**/*.js*

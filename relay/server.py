@@ -644,7 +644,7 @@ def create_app() -> web.Application:
 
 
 async def main():
-    port = int(os.getenv("RELAY_PORT", "8080"))
+    port = int(os.getenv("RELAY_PORT", "8100"))
     host = os.getenv("RELAY_HOST", "0.0.0.0")
 
     logger.info(f"vstunnel Relay Server v{RELAY_VERSION}")

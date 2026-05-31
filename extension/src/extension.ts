@@ -38,7 +38,7 @@ async function startBridge(context: vscode.ExtensionContext) {
     }
 
     const config = vscode.workspace.getConfiguration('vstunnel');
-    const port = config.get<number>('port') ?? 8080;
+    const port = config.get<number>('port') ?? 8100;
     const requireToken = config.get<boolean>('requireToken') ?? true;
     const autoForward = config.get<boolean>('autoForward') ?? true;
     const relayUrl = config.get<string>('relayUrl') ?? '';
