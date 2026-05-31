@@ -2,7 +2,7 @@
   "name": "vstunnel",
   "displayName": "vstunnel - Mobile Copilot Bridge",
   "description": "Control GitHub Copilot from your phone. Send prompts, monitor status, and approve actions remotely.",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "publisher": "vstunnel",
   "license": "MIT",
   "engines": {
@@ -64,6 +64,16 @@
           "type": "boolean",
           "default": true,
           "description": "Require authentication token for mobile connections"
+        },
+        "vstunnel.relayUrl": {
+          "type": "string",
+          "default": "",
+          "description": "Relay server URL (e.g., http://vstunnel.siemens.internal:8080). When set, connects outbound to relay instead of requiring port forwarding."
+        },
+        "vstunnel.userId": {
+          "type": "string",
+          "default": "",
+          "description": "Your user ID shown to phone clients. Defaults to system username if empty."
         }
       }
     },

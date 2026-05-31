@@ -1,24 +1,23 @@
 #!/usr/bin/env python3
 """
-vstunnel Relay Server — Central bridge for corporate deployments.
+vstunnel Relay Server v2 — Multi-instance Copilot bridge.
 
-Laptops connect outbound to this relay and register their user/workspace.
-Phones connect to this relay and pick a user to send prompts to.
-The relay routes messages between matched pairs. No data is stored.
+Laptops (VS Code extensions) connect outbound and register per-instance.
+Phones connect and receive streamed events (file changes, diffs, terminal output).
+Phone commands are routed to specific instances.
 
 Endpoints:
   GET  /health              — Health check
-  GET  /ws/laptop           — WebSocket for laptop daemons
+  GET  /ws/laptop           — WebSocket for VS Code extension instances
   GET  /ws/phone            — WebSocket for phone clients
   GET  /api/connect         — HTTP polling: create phone session
   GET  /api/poll            — HTTP polling: receive messages
-  POST /api/send            — HTTP polling: send message
-  GET  /api/users           — List registered laptop users
+  POST /api/send            — HTTP polling: send command
+  GET  /api/users           — List registered users and instances
   GET  /*                   — Serve mobile frontend
 """
 
 import asyncio
-import hashlib
 import json
 import logging
 import os
@@ -26,6 +25,7 @@ import secrets
 import signal
 import sys
 import uuid
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -39,77 +39,146 @@ logging.basicConfig(
 )
 logger = logging.getLogger("vstunnel-relay")
 
-RELAY_VERSION = "1.0.0"
+RELAY_VERSION = "2.0.0"
 POLL_SESSION_TIMEOUT = 120
+MAX_EVENT_BUFFER = 200
 FRONTEND_DIR = Path(os.getenv("FRONTEND_DIR", str(Path(__file__).parent.parent / "frontend")))
-ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
 
 
 # ─── State ────────────────────────────────────────────────────────────────────
 
 
-class LaptopSession:
-    def __init__(self, user_id: str, ws, workspaces: list = None):
+class InstanceSession:
+    """A single VS Code instance connected to the relay."""
+
+    def __init__(self, instance_id: str, user_id: str, workspace_name: str,
+                 workspace_path: str, ws):
+        self.instance_id = instance_id
         self.user_id = user_id
+        self.workspace_name = workspace_name
+        self.workspace_path = workspace_path
         self.ws = ws
-        self.workspaces = workspaces or []
         self.connected_at = datetime.now(timezone.utc)
         self.last_seen = datetime.now(timezone.utc)
         self.pending_responses: dict[str, asyncio.Future] = {}
+        self.event_buffer: deque = deque(maxlen=MAX_EVENT_BUFFER)
+        self.seq = 0
 
     def to_dict(self) -> dict:
         return {
+            "instance_id": self.instance_id,
             "user_id": self.user_id,
-            "workspaces": self.workspaces,
+            "workspace_name": self.workspace_name,
+            "workspace_path": self.workspace_path,
             "connected_at": self.connected_at.isoformat() + "Z",
             "online": not self.ws.closed,
+            "event_count": len(self.event_buffer),
         }
 
 
 class RelayState:
     def __init__(self):
-        self.laptops: dict[str, LaptopSession] = {}  # user_id -> LaptopSession
-        self.phone_ws_sessions: dict[str, web.WebSocketResponse] = {}  # phone ws -> target user_id
-        self.poll_sessions: dict[str, dict] = {}  # session_id -> {user_id, messages, last_poll}
+        self.users: dict[str, dict] = {}
+        # users[user_id] = {
+        #   "token": str,
+        #   "instances": {instance_id: InstanceSession}
+        # }
+        self.phone_ws_sessions: dict[int, dict] = {}
+        # phone ws id -> {"user_id": str, "ws": WebSocketResponse}
+        self.poll_sessions: dict[str, dict] = {}
         self.start_time = datetime.now(timezone.utc)
         self.total_prompts = 0
-        self.auth_tokens: dict[str, str] = {}  # user_id -> token (generated on laptop register)
         self.shutdown_event = asyncio.Event()
 
     @property
     def uptime_seconds(self) -> int:
         return int((datetime.now(timezone.utc) - self.start_time).total_seconds())
 
-    def register_laptop(self, user_id: str, ws, workspaces: list = None) -> str:
-        token = self.auth_tokens.get(user_id, secrets.token_hex(16))
-        self.auth_tokens[user_id] = token
-        self.laptops[user_id] = LaptopSession(user_id, ws, workspaces)
-        logger.info(f"Laptop registered: {user_id} ({len(workspaces or [])} workspaces)")
-        return token
+    def register_instance(self, user_id: str, instance_id: str,
+                          workspace_name: str, workspace_path: str, ws) -> str:
+        if user_id not in self.users:
+            self.users[user_id] = {
+                "token": secrets.token_hex(16),
+                "instances": {},
+            }
 
-    def unregister_laptop(self, user_id: str):
-        self.laptops.pop(user_id, None)
-        logger.info(f"Laptop unregistered: {user_id}")
+        user = self.users[user_id]
+        user["instances"][instance_id] = InstanceSession(
+            instance_id, user_id, workspace_name, workspace_path, ws
+        )
+        logger.info(f"Instance registered: {user_id}/{workspace_name} ({instance_id})")
+        return user["token"]
 
-    def get_laptop(self, user_id: str) -> LaptopSession | None:
-        session = self.laptops.get(user_id)
-        if session and not session.ws.closed:
-            return session
-        if session and session.ws.closed:
-            self.laptops.pop(user_id, None)
+    def unregister_instance(self, user_id: str, instance_id: str):
+        user = self.users.get(user_id)
+        if user:
+            user["instances"].pop(instance_id, None)
+            if not user["instances"]:
+                self.users.pop(user_id, None)
+        logger.info(f"Instance unregistered: {user_id}/{instance_id}")
+
+    def get_instance(self, user_id: str, instance_id: str) -> InstanceSession | None:
+        user = self.users.get(user_id)
+        if not user:
+            return None
+        instance = user["instances"].get(instance_id)
+        if instance and not instance.ws.closed:
+            return instance
+        if instance and instance.ws.closed:
+            user["instances"].pop(instance_id, None)
         return None
 
-    def list_users(self) -> list[dict]:
+    def get_user_instances(self, user_id: str) -> list[InstanceSession]:
+        user = self.users.get(user_id)
+        if not user:
+            return []
         live = []
         stale = []
-        for uid, session in self.laptops.items():
-            if session.ws.closed:
-                stale.append(uid)
+        for iid, inst in user["instances"].items():
+            if inst.ws.closed:
+                stale.append(iid)
             else:
-                live.append(session.to_dict())
-        for uid in stale:
-            self.laptops.pop(uid, None)
+                live.append(inst)
+        for iid in stale:
+            user["instances"].pop(iid, None)
         return live
+
+    def list_users(self) -> list[dict]:
+        result = []
+        stale_users = []
+        for uid, user in self.users.items():
+            instances = []
+            stale_instances = []
+            for iid, inst in user["instances"].items():
+                if inst.ws.closed:
+                    stale_instances.append(iid)
+                else:
+                    instances.append(inst.to_dict())
+            for iid in stale_instances:
+                user["instances"].pop(iid, None)
+            if instances:
+                result.append({
+                    "user_id": uid,
+                    "instances": instances,
+                    "online": True,
+                })
+            else:
+                stale_users.append(uid)
+        for uid in stale_users:
+            self.users.pop(uid, None)
+        return result
+
+    def verify_token(self, user_id: str, token: str) -> bool:
+        user = self.users.get(user_id)
+        if not user:
+            return False
+        return secrets.compare_digest(user["token"], token)
+
+    def get_phone_sessions_for_user(self, user_id: str) -> list:
+        return [
+            s for s in self.phone_ws_sessions.values()
+            if s["user_id"] == user_id
+        ]
 
     def create_poll_session(self, user_id: str) -> str:
         session_id = uuid.uuid4().hex[:16]
@@ -127,12 +196,12 @@ class RelayState:
             session["last_poll"] = datetime.now(timezone.utc)
         return session
 
-    def queue_poll_message(self, session_id: str, message: dict):
-        session = self.poll_sessions.get(session_id)
-        if session:
-            session["messages"].append(message)
-            if len(session["messages"]) > 200:
-                session["messages"] = session["messages"][-200:]
+    def queue_poll_message(self, user_id: str, message: dict):
+        for sid, session in self.poll_sessions.items():
+            if session["user_id"] == user_id:
+                session["messages"].append(message)
+                if len(session["messages"]) > 200:
+                    session["messages"] = session["messages"][-200:]
 
     def drain_poll_messages(self, session_id: str) -> list:
         session = self.poll_sessions.get(session_id)
@@ -151,22 +220,8 @@ class RelayState:
         for sid in stale:
             del self.poll_sessions[sid]
 
-        dead = [uid for uid, s in self.laptops.items() if s.ws.closed]
-        for uid in dead:
-            self.laptops.pop(uid, None)
-
 
 state = RelayState()
-
-
-# ─── Auth Helpers ─────────────────────────────────────────────────────────────
-
-
-def verify_phone_token(user_id: str, token: str) -> bool:
-    expected = state.auth_tokens.get(user_id)
-    if not expected:
-        return False
-    return secrets.compare_digest(expected, token)
 
 
 CORS_HEADERS = {
@@ -185,11 +240,15 @@ async def handle_cors(request):
 
 async def handle_health(request):
     state.cleanup_stale()
+    total_instances = sum(
+        len(u["instances"]) for u in state.users.values()
+    )
     return web.json_response({
         "status": "healthy",
         "version": RELAY_VERSION,
         "uptime": state.uptime_seconds,
-        "registered_laptops": len(state.laptops),
+        "registered_users": len(state.users),
+        "registered_instances": total_instances,
         "poll_sessions": len(state.poll_sessions),
         "total_prompts": state.total_prompts,
     }, headers=CORS_HEADERS)
@@ -201,26 +260,27 @@ async def handle_api_users(request):
 
 
 async def handle_api_connect(request):
-    """Phone creates a polling session targeted at a specific user."""
+    """Phone creates a polling session targeted at a user."""
     user_id = request.query.get("user")
-    token = request.query.get("token") or request.headers.get("Authorization", "").replace("Bearer ", "")
+    token = (request.query.get("token") or
+             request.headers.get("Authorization", "").replace("Bearer ", ""))
 
     if not user_id:
         return web.json_response(
-            {"type": "ERROR", "message": "Missing 'user' query parameter"},
+            {"type": "ERROR", "message": "Missing 'user' parameter"},
             status=400, headers=CORS_HEADERS,
         )
 
-    if not verify_phone_token(user_id, token):
+    if not state.verify_token(user_id, token):
         return web.json_response(
-            {"type": "ERROR", "message": "Invalid token for this user"},
+            {"type": "ERROR", "message": "Invalid token"},
             status=401, headers=CORS_HEADERS,
         )
 
-    laptop = state.get_laptop(user_id)
-    if not laptop:
+    instances = state.get_user_instances(user_id)
+    if not instances:
         return web.json_response(
-            {"type": "ERROR", "message": f"User '{user_id}' is not online"},
+            {"type": "ERROR", "message": f"User '{user_id}' has no active instances"},
             status=404, headers=CORS_HEADERS,
         )
 
@@ -232,7 +292,7 @@ async def handle_api_connect(request):
         "session_id": session_id,
         "version": RELAY_VERSION,
         "user_id": user_id,
-        "workspaces": laptop.workspaces,
+        "instances": [i.to_dict() for i in instances],
         "transport": "polling",
         "poll_interval_ms": 2000,
         "timestamp": datetime.now(timezone.utc).isoformat() + "Z",
@@ -256,23 +316,11 @@ async def handle_api_poll(request):
         )
 
     messages = state.drain_poll_messages(session_id)
-
-    user_id = session["user_id"]
-    laptop = state.get_laptop(user_id)
-    status_msg = {
-        "type": "STATUS_UPDATE",
-        "user_id": user_id,
-        "online": laptop is not None,
-        "workspaces": laptop.workspaces if laptop else [],
-        "timestamp": datetime.now(timezone.utc).isoformat() + "Z",
-    }
-    messages.append(status_msg)
-
     return web.json_response({"messages": messages}, headers=CORS_HEADERS)
 
 
 async def handle_api_send(request):
-    """Phone sends a message to the laptop via HTTP."""
+    """Phone sends a command to a specific instance via HTTP."""
     session_id = request.headers.get("X-Session-Id") or request.query.get("session")
 
     session = state.get_poll_session(session_id) if session_id else None
@@ -291,14 +339,28 @@ async def handle_api_send(request):
         )
 
     user_id = session["user_id"]
-    return await forward_to_laptop(user_id, data, session_id=session_id)
+    instance_id = data.get("instance_id")
+
+    if instance_id:
+        return await forward_to_instance(user_id, instance_id, data, session_id=session_id)
+    else:
+        instances = state.get_user_instances(user_id)
+        if instances:
+            return await forward_to_instance(
+                user_id, instances[0].instance_id, data, session_id=session_id
+            )
+        return web.json_response(
+            {"type": "ERROR", "message": "No active instances"},
+            status=502, headers=CORS_HEADERS,
+        )
 
 
-async def forward_to_laptop(user_id: str, data: dict, session_id: str = None, phone_ws=None):
-    """Forward a message from a phone to the target laptop, wait for response."""
-    laptop = state.get_laptop(user_id)
-    if not laptop:
-        err = {"type": "ERROR", "message": f"User '{user_id}' is offline"}
+async def forward_to_instance(user_id: str, instance_id: str, data: dict,
+                              session_id: str = None, phone_ws=None):
+    """Forward a command from phone to a specific VS Code instance."""
+    instance = state.get_instance(user_id, instance_id)
+    if not instance:
+        err = {"type": "ERROR", "message": f"Instance '{instance_id}' is offline"}
         if session_id:
             return web.json_response(err, status=502, headers=CORS_HEADERS)
         return err
@@ -307,13 +369,13 @@ async def forward_to_laptop(user_id: str, data: dict, session_id: str = None, ph
     data["_relay_request_id"] = request_id
 
     future = asyncio.get_event_loop().create_future()
-    laptop.pending_responses[request_id] = future
+    instance.pending_responses[request_id] = future
 
     try:
-        await laptop.ws.send_json(data)
+        await instance.ws.send_json(data)
     except Exception as e:
-        laptop.pending_responses.pop(request_id, None)
-        err = {"type": "ERROR", "message": f"Failed to reach laptop: {e}"}
+        instance.pending_responses.pop(request_id, None)
+        err = {"type": "ERROR", "message": f"Failed to reach instance: {e}"}
         if session_id:
             return web.json_response(err, status=502, headers=CORS_HEADERS)
         return err
@@ -321,8 +383,8 @@ async def forward_to_laptop(user_id: str, data: dict, session_id: str = None, ph
     try:
         response = await asyncio.wait_for(future, timeout=60.0)
     except asyncio.TimeoutError:
-        laptop.pending_responses.pop(request_id, None)
-        err = {"type": "ERROR", "message": "Laptop did not respond in time"}
+        instance.pending_responses.pop(request_id, None)
+        err = {"type": "ERROR", "message": "Instance did not respond in time"}
         if session_id:
             return web.json_response(err, status=504, headers=CORS_HEADERS)
         return err
@@ -333,13 +395,28 @@ async def forward_to_laptop(user_id: str, data: dict, session_id: str = None, ph
         state.total_prompts += 1
 
     if session_id:
-        state.queue_poll_message(session_id, response)
+        state.queue_poll_message(user_id, response)
         return web.json_response(response, headers=CORS_HEADERS)
 
     return response
 
 
-# ─── WebSocket: Laptop ───────────────────────────────────────────────────────
+async def push_event_to_phones(user_id: str, event: dict):
+    """Push an event from a laptop instance to all connected phones for that user."""
+    # Send to WebSocket phone clients
+    for phone_session in state.get_phone_sessions_for_user(user_id):
+        ws = phone_session.get("ws")
+        if ws and not ws.closed:
+            try:
+                await ws.send_json(event)
+            except Exception:
+                pass
+
+    # Queue for polling phone clients
+    state.queue_poll_message(user_id, event)
+
+
+# ─── WebSocket: Laptop (VS Code Extension) ──────────────────────────────────
 
 
 async def handle_ws_laptop(request):
@@ -347,6 +424,7 @@ async def handle_ws_laptop(request):
     await ws.prepare(request)
 
     user_id = None
+    instance_id = None
 
     try:
         async for msg in ws:
@@ -361,48 +439,76 @@ async def handle_ws_laptop(request):
 
                 if msg_type == "REGISTER":
                     user_id = data.get("user_id", "").strip()
+                    instance_id = data.get("instance_id", "").strip()
+                    workspace_name = data.get("workspace_name", "Untitled")
+                    workspace_path = data.get("workspace_path", "")
+
                     if not user_id:
                         await ws.send_json({"type": "ERROR", "message": "Missing user_id"})
                         continue
 
-                    workspaces = data.get("workspaces", [])
-                    token = state.register_laptop(user_id, ws, workspaces)
+                    if not instance_id:
+                        instance_id = uuid.uuid4().hex[:12]
+
+                    token = state.register_instance(
+                        user_id, instance_id, workspace_name, workspace_path, ws
+                    )
 
                     await ws.send_json({
                         "type": "REGISTERED",
                         "user_id": user_id,
+                        "instance_id": instance_id,
                         "token": token,
                         "relay_version": RELAY_VERSION,
                         "timestamp": datetime.now(timezone.utc).isoformat() + "Z",
                     })
 
-                elif msg_type == "UPDATE_WORKSPACES":
-                    if user_id and user_id in state.laptops:
-                        state.laptops[user_id].workspaces = data.get("workspaces", [])
-                        await ws.send_json({"type": "WORKSPACES_UPDATED"})
+                elif msg_type == "PUSH_EVENT":
+                    if user_id:
+                        event = data.get("event", data)
+                        event.pop("type", None)
+                        event_type = event.pop("type", data.get("event", {}).get("type", "AGENT_ACTIVITY"))
+
+                        # Reconstruct as a proper event
+                        push_data = {**event, "type": event_type}
+                        if "instance_id" not in push_data:
+                            push_data["instance_id"] = instance_id
+                        if "workspace" not in push_data:
+                            push_data["workspace"] = data.get("workspace", "")
+
+                        # Buffer the event
+                        instance = state.get_instance(user_id, instance_id)
+                        if instance:
+                            instance.seq += 1
+                            push_data["seq"] = instance.seq
+                            instance.event_buffer.append(push_data)
+
+                        await push_event_to_phones(user_id, push_data)
 
                 elif msg_type == "RESPONSE":
                     request_id = data.get("_relay_request_id")
-                    if user_id and request_id:
-                        laptop = state.get_laptop(user_id)
-                        if laptop:
-                            future = laptop.pending_responses.pop(request_id, None)
+                    if user_id and instance_id and request_id:
+                        instance = state.get_instance(user_id, instance_id)
+                        if instance:
+                            future = instance.pending_responses.pop(request_id, None)
                             if future and not future.done():
                                 future.set_result(data)
 
                 elif msg_type == "PONG":
-                    if user_id and user_id in state.laptops:
-                        state.laptops[user_id].last_seen = datetime.now(timezone.utc)
+                    if user_id and instance_id:
+                        instance = state.get_instance(user_id, instance_id)
+                        if instance:
+                            instance.last_seen = datetime.now(timezone.utc)
 
             elif msg.type == web.WSMsgType.ERROR:
-                logger.error(f"Laptop WS error ({user_id}): {ws.exception()}")
+                logger.error(f"Laptop WS error ({user_id}/{instance_id}): {ws.exception()}")
 
     except Exception as e:
-        logger.error(f"Laptop connection error ({user_id}): {e}")
+        logger.error(f"Laptop connection error ({user_id}/{instance_id}): {e}")
     finally:
-        if user_id:
-            state.unregister_laptop(user_id)
-        logger.info(f"Laptop disconnected: {user_id}")
+        if user_id and instance_id:
+            state.unregister_instance(user_id, instance_id)
+        logger.info(f"Laptop disconnected: {user_id}/{instance_id}")
 
     return ws
 
@@ -436,23 +542,23 @@ async def handle_ws_phone(request):
                         await ws.send_json({"type": "ERROR", "message": "Missing user_id"})
                         continue
 
-                    if not verify_phone_token(target_user, token):
+                    if not state.verify_token(target_user, token):
                         await ws.send_json({"type": "ERROR", "message": "Invalid token"})
                         continue
 
-                    laptop = state.get_laptop(target_user)
-                    if not laptop:
-                        await ws.send_json({"type": "ERROR", "message": f"User '{target_user}' is offline"})
+                    instances = state.get_user_instances(target_user)
+                    if not instances:
+                        await ws.send_json({"type": "ERROR", "message": f"User '{target_user}' has no active instances"})
                         continue
 
                     authenticated = True
-                    state.phone_ws_sessions[id(ws)] = target_user
+                    state.phone_ws_sessions[id(ws)] = {"user_id": target_user, "ws": ws}
 
                     await ws.send_json({
                         "type": "WELCOME",
                         "version": RELAY_VERSION,
                         "user_id": target_user,
-                        "workspaces": laptop.workspaces,
+                        "instances": [i.to_dict() for i in instances],
                         "timestamp": datetime.now(timezone.utc).isoformat() + "Z",
                     })
 
@@ -460,8 +566,37 @@ async def handle_ws_phone(request):
                     users = state.list_users()
                     await ws.send_json({"type": "USER_LIST", "users": users})
 
+                elif msg_type == "GET_INSTANCES":
+                    if authenticated and target_user:
+                        instances = state.get_user_instances(target_user)
+                        await ws.send_json({
+                            "type": "INSTANCE_LIST",
+                            "instances": [i.to_dict() for i in instances],
+                        })
+
+                elif msg_type == "GET_EVENTS_SINCE":
+                    if authenticated and target_user:
+                        instance_id = data.get("instance_id")
+                        since_seq = data.get("since_seq", 0)
+                        instance = state.get_instance(target_user, instance_id) if instance_id else None
+                        if instance:
+                            events = [e for e in instance.event_buffer if e.get("seq", 0) > since_seq]
+                            await ws.send_json({"type": "EVENT_REPLAY", "events": events})
+                        else:
+                            await ws.send_json({"type": "EVENT_REPLAY", "events": []})
+
                 elif authenticated and target_user:
-                    response = await forward_to_laptop(target_user, data)
+                    instance_id = data.get("instance_id")
+                    if instance_id:
+                        response = await forward_to_instance(target_user, instance_id, data)
+                    else:
+                        instances = state.get_user_instances(target_user)
+                        if instances:
+                            response = await forward_to_instance(
+                                target_user, instances[0].instance_id, data
+                            )
+                        else:
+                            response = {"type": "ERROR", "message": "No active instances"}
                     if isinstance(response, dict):
                         await ws.send_json(response)
 
@@ -516,7 +651,6 @@ async def main():
     logger.info(f"Listening on {host}:{port}")
     logger.info(f"Laptop WebSocket: ws://{host}:{port}/ws/laptop")
     logger.info(f"Phone WebSocket:  ws://{host}:{port}/ws/phone")
-    logger.info(f"Phone HTTP API:   http://{host}:{port}/api/connect")
     logger.info(f"Mobile UI:        http://{host}:{port}/")
 
     app = create_app()
@@ -535,11 +669,12 @@ async def main():
     await state.shutdown_event.wait()
 
     logger.info("Shutting down...")
-    for uid, session in list(state.laptops.items()):
-        try:
-            await session.ws.close()
-        except Exception:
-            pass
+    for uid, user in list(state.users.items()):
+        for iid, inst in list(user["instances"].items()):
+            try:
+                await inst.ws.close()
+            except Exception:
+                pass
     await runner.cleanup()
 
 

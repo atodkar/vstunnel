@@ -2,140 +2,103 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta name="description" content="vstunnel - Mobile Copilot Bridge for GitHub Copilot">
-    <title>vstunnel - Mobile Copilot</title>
-    <link rel="stylesheet" href="css/styles.css">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>vstunnel - Copilot Remote</title>
+    <link rel="stylesheet" href="/css/styles.css">
 </head>
 <body>
-    <div id="app" class="container">
-        <!-- Header -->
-        <header class="header">
-            <div class="logo">
-                <span class="icon">🚀</span>
-                <h1>vstunnel</h1>
+    <!-- Connection Setup -->
+    <div id="setupPanel" class="panel">
+        <h1>vstunnel</h1>
+        <p class="subtitle">Remote Copilot Monitor</p>
+        <div class="form-group">
+            <label for="relayUrl">Relay Server URL</label>
+            <input type="url" id="relayUrl" placeholder="http://vstunnel.siemens.internal:8080">
+        </div>
+        <button id="btnConnect" class="btn btn-primary">Connect</button>
+        <div id="setupError" class="error-msg hidden"></div>
+    </div>
+
+    <!-- User Selection -->
+    <div id="userPanel" class="panel hidden">
+        <h2>Select User</h2>
+        <div id="userList" class="user-list"></div>
+        <div class="form-group">
+            <label for="authToken">Auth Token</label>
+            <input type="text" id="authToken" placeholder="Paste token from laptop terminal">
+        </div>
+        <button id="btnAuth" class="btn btn-primary" disabled>Connect to User</button>
+        <button id="btnDisconnect" class="btn btn-secondary">Back</button>
+    </div>
+
+    <!-- Main Interface -->
+    <div id="mainPanel" class="panel hidden">
+        <!-- Approval Banner -->
+        <div id="approvalBanner" class="approval-banner hidden">
+            <div class="approval-text" id="approvalText"></div>
+            <div class="approval-actions">
+                <button id="btnAccept" class="btn btn-accept">Accept</button>
+                <button id="btnReject" class="btn btn-reject">Reject</button>
             </div>
-            <div class="status-badge" id="statusBadge">
-                <span class="status-dot" id="statusDot"></span>
-                <span id="statusText">Disconnected</span>
+        </div>
+
+        <!-- Workspace Tabs -->
+        <div id="workspaceTabs" class="workspace-tabs">
+            <button class="ws-tab active" data-instance="all">All</button>
+        </div>
+
+        <!-- Content Tabs -->
+        <div class="tab-bar">
+            <button class="tab active" data-tab="activity">Activity</button>
+            <button class="tab" data-tab="diff">Diff</button>
+            <button class="tab" data-tab="prompt">Prompt</button>
+        </div>
+
+        <!-- Activity Tab -->
+        <div id="tabActivity" class="tab-content active">
+            <div id="activityFeed" class="activity-feed">
+                <div class="empty-state">Waiting for Copilot activity...</div>
             </div>
-        </header>
+        </div>
 
-        <!-- Connection Setup Panel -->
-        <section id="setupPanel" class="panel setup-panel">
-            <h2>Connection Setup</h2>
-            <div class="form-group">
-                <label for="tunnelUrl">VS Code Tunnel URL:</label>
-                <input
-                    type="text"
-                    id="tunnelUrl"
-                    placeholder="e.g., xk7abc123-8080.use2.devtunnels.ms"
-                    class="input-field"
-                >
-                <small>Get this from VS Code Ports panel</small>
+        <!-- Diff Tab -->
+        <div id="tabDiff" class="tab-content">
+            <div id="diffHeader" class="diff-header">
+                <span id="diffStats">No changes yet</span>
+                <button id="btnRefreshDiff" class="btn btn-small">Refresh</button>
             </div>
-            <button id="connectBtn" class="btn btn-primary">
-                Connect to Daemon
-            </button>
-        </section>
-
-        <!-- Workspace Selector (shown after connect, before control panel) -->
-        <section id="workspacePanel" class="panel workspace-panel" style="display: none;">
-            <h2>Select VS Code Instance</h2>
-            <p class="panel-description">Multiple VS Code windows detected. Choose which workspace to send prompts to:</p>
-
-            <div id="workspaceList" class="workspace-list">
-                <!-- Populated dynamically -->
+            <div id="diffContent" class="diff-content">
+                <div class="empty-state">No file changes detected</div>
             </div>
+        </div>
 
-            <div class="workspace-actions">
-                <button id="refreshWorkspacesBtn" class="btn btn-secondary">
-                    Refresh List
-                </button>
+        <!-- Prompt Tab -->
+        <div id="tabPrompt" class="tab-content">
+            <div class="prompt-target">
+                <label>Target:</label>
+                <select id="promptTarget">
+                    <option value="active_session">Active Session</option>
+                    <option value="new_chat">New Chat</option>
+                    <option value="inline">Inline Edit</option>
+                </select>
             </div>
-        </section>
-
-        <!-- Main Control Panel (shown after workspace selection) -->
-        <section id="controlPanel" class="panel control-panel" style="display: none;">
-            <!-- Active Workspace Indicator -->
-            <div class="active-workspace" id="activeWorkspace">
-                <span class="workspace-label">Target:</span>
-                <span class="workspace-name" id="activeWorkspaceName">Default (single instance)</span>
-                <button id="changeWorkspaceBtn" class="btn-link">Change</button>
+            <textarea id="promptInput" placeholder="Send a follow-up prompt to Copilot..." rows="4"></textarea>
+            <div class="prompt-actions">
+                <button id="btnSendPrompt" class="btn btn-primary">Send</button>
+                <button id="btnQuickContinue" class="btn btn-secondary">Continue</button>
+                <button id="btnQuickExplain" class="btn btn-secondary">Explain</button>
             </div>
+            <div id="promptHistory" class="prompt-history"></div>
+        </div>
 
-            <!-- Status Display -->
-            <div class="status-display">
-                <div class="stat-item">
-                    <span class="stat-label">OS:</span>
-                    <span id="osInfo" class="stat-value">—</span>
-                </div>
-                <div class="stat-item">
-                    <span class="stat-label">Version:</span>
-                    <span id="versionInfo" class="stat-value">—</span>
-                </div>
-                <div class="stat-item">
-                    <span class="stat-label">Uptime:</span>
-                    <span id="uptimeInfo" class="stat-value">—</span>
-                </div>
-            </div>
-
-            <!-- Prompt Input Section -->
-            <div class="prompt-section">
-                <h2>Send Prompt to Copilot</h2>
-                <textarea
-                    id="promptInput"
-                    placeholder="Type your prompt here... (e.g., 'Fix the failing test in auth.test.ts')"
-                    class="textarea-field"
-                ></textarea>
-                <div class="button-group">
-                    <button id="sendBtn" class="btn btn-success">
-                        📤 Send Prompt
-                    </button>
-                    <button id="clearBtn" class="btn btn-secondary">
-                        Clear
-                    </button>
-                </div>
-            </div>
-
-            <!-- Prompt History Section -->
-            <div class="history-section">
-                <div class="section-header">
-                    <h3>Prompt History</h3>
-                    <button id="loadHistoryBtn" class="btn-link">Load History</button>
-                </div>
-                <div id="historyList" class="history-list">
-                    <p class="empty-state">No prompts sent yet</p>
-                </div>
-            </div>
-
-            <!-- Activity Log -->
-            <div class="activity-section">
-                <div class="section-header">
-                    <h3>Live Activity</h3>
-                    <button id="clearLogBtn" class="btn-link">Clear</button>
-                </div>
-                <div id="activityLog" class="activity-log">
-                    <!-- Populated dynamically -->
-                </div>
-            </div>
-
-            <!-- Disconnect Button -->
-            <button id="disconnectBtn" class="btn btn-danger">
-                🔌 Disconnect
-            </button>
-        </section>
-
-        <!-- Error Panel -->
-        <div id="errorPanel" class="panel error-panel" style="display: none;">
-            <h3>⚠️ Error</h3>
-            <p id="errorMessage"></p>
-            <button id="errorCloseBtn" class="btn btn-secondary">
-                Dismiss
-            </button>
+        <!-- Status Bar -->
+        <div class="status-bar">
+            <span id="statusDot" class="status-dot connected"></span>
+            <span id="statusText">Connected</span>
+            <button id="btnMainDisconnect" class="btn btn-small btn-secondary">Disconnect</button>
         </div>
     </div>
 
-    <script src="js/app.js"></script>
+    <script src="/js/app.js"></script>
 </body>
 </html>

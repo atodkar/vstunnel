@@ -1,6 +1,7 @@
 import * as crypto from 'crypto';
 import * as vscode from 'vscode';
 import { WebSocketServer, WebSocket } from 'ws';
+import { CopilotMonitor } from './monitor';
 
 export interface BridgeServerOptions {
     port: number;
@@ -11,6 +12,7 @@ export interface BridgeServerOptions {
     onPrompt: (prompt: string) => Promise<{ status: string; message: string }>;
     onStatusChange: () => void;
     onHistoryChange: () => void;
+    monitor?: CopilotMonitor;
 }
 
 interface PromptHistoryEntry {
@@ -30,11 +32,17 @@ export class BridgeServer {
     private _authToken: string | null = null;
     private _tunnelUrl: string | null = null;
     private statusInterval: NodeJS.Timeout | null = null;
+    private monitorDisposable: vscode.Disposable | undefined;
 
     constructor(options: BridgeServerOptions) {
         this.options = options;
         if (options.requireToken) {
             this._authToken = this.loadOrGenerateToken(options.context);
+        }
+        if (options.monitor) {
+            this.monitorDisposable = options.monitor.onEvent(event => {
+                this.broadcastEvent(event);
+            });
         }
     }
 
@@ -95,6 +103,7 @@ export class BridgeServer {
         if (this.statusInterval) {
             clearInterval(this.statusInterval);
         }
+        this.monitorDisposable?.dispose();
 
         for (const client of this.clients) {
             client.close(1001, 'Server shutting down');
@@ -118,10 +127,9 @@ export class BridgeServer {
         this.clients.add(ws);
         this.options.onStatusChange();
 
-        // Send welcome message
         this.send(ws, {
             type: 'WELCOME',
-            version: '1.0.0',
+            version: '2.0.0',
             workspace: this.options.workspaceName,
             workspace_path: this.options.workspacePath,
             requires_auth: this.options.requireToken,
@@ -135,7 +143,6 @@ export class BridgeServer {
                 const data = JSON.parse(raw.toString());
                 const msgType = data.type;
 
-                // Authentication gate
                 if (!authenticated) {
                     if (msgType === 'AUTH') {
                         if (data.token === this._authToken) {
@@ -151,19 +158,27 @@ export class BridgeServer {
                     return;
                 }
 
-                // Authenticated message handling
                 switch (msgType) {
                     case 'PROMPT':
                         await this.handlePrompt(ws, data);
+                        break;
+                    case 'INJECT_PROMPT':
+                        await this.handleInjectPrompt(ws, data);
+                        break;
+                    case 'GET_DIFF':
+                        await this.handleGetDiff(ws);
+                        break;
+                    case 'REVERT_FILE':
+                        await this.handleRevertFile(ws, data);
+                        break;
+                    case 'GET_STATE':
+                        this.handleGetState(ws);
                         break;
                     case 'PING':
                         this.send(ws, { type: 'PONG', timestamp: new Date().toISOString() });
                         break;
                     case 'HISTORY':
-                        this.send(ws, {
-                            type: 'HISTORY_RESPONSE',
-                            history: this._history.slice(-20),
-                        });
+                        this.send(ws, { type: 'HISTORY_RESPONSE', history: this._history.slice(-20) });
                         break;
                     case 'GET_STATUS':
                         this.sendStatus(ws);
@@ -193,7 +208,6 @@ export class BridgeServer {
             this.send(ws, { type: 'ERROR', message: 'Empty prompt' });
             return;
         }
-
         if (prompt.length > 10000) {
             this.send(ws, { type: 'ERROR', message: 'Prompt too long (max 10000 chars)' });
             return;
@@ -202,16 +216,13 @@ export class BridgeServer {
         const result = await this.options.onPrompt(prompt);
         this._totalPrompts++;
 
-        const entry: PromptHistoryEntry = {
+        this._history.push({
             prompt: prompt.substring(0, 200),
             result: result.status,
             workspace: this.options.workspaceName,
             timestamp: new Date().toISOString(),
-        };
-        this._history.push(entry);
-        if (this._history.length > 100) {
-            this._history = this._history.slice(-100);
-        }
+        });
+        if (this._history.length > 100) this._history = this._history.slice(-100);
 
         this.send(ws, {
             type: 'PROMPT_ACK',
@@ -219,8 +230,76 @@ export class BridgeServer {
             workspace: this.options.workspaceName,
             timestamp: new Date().toISOString(),
         });
-
         this.options.onHistoryChange();
+    }
+
+    private async handleInjectPrompt(ws: WebSocket, data: any) {
+        const prompt = (data.prompt || '').trim();
+        if (!prompt) {
+            this.send(ws, { type: 'COMMAND_RESULT', command: 'INJECT_PROMPT', success: false, message: 'Empty prompt' });
+            return;
+        }
+
+        const monitor = this.options.monitor;
+        if (monitor) {
+            const target = data.target || 'active_session';
+            const success = await monitor.promptInjector.injectPrompt(prompt, target);
+            this.send(ws, { type: 'COMMAND_RESULT', command: 'INJECT_PROMPT', success, message: success ? 'Prompt delivered' : 'Failed' });
+        } else {
+            const result = await this.options.onPrompt(prompt);
+            this.send(ws, { type: 'COMMAND_RESULT', command: 'INJECT_PROMPT', success: result.status === 'SUCCESS', message: result.message });
+        }
+    }
+
+    private async handleGetDiff(ws: WebSocket) {
+        const monitor = this.options.monitor;
+        if (monitor) {
+            const diff = await monitor.diffGenerator.generateDiff();
+            this.send(ws, { type: 'COMMAND_RESULT', command: 'GET_DIFF', success: true, data: diff });
+        } else {
+            this.send(ws, { type: 'COMMAND_RESULT', command: 'GET_DIFF', success: false, message: 'Monitor not active' });
+        }
+    }
+
+    private async handleRevertFile(ws: WebSocket, data: any) {
+        const filePath = data.filePath;
+        const monitor = this.options.monitor;
+        if (monitor && filePath) {
+            const success = await monitor.diffGenerator.revertFile(filePath);
+            this.send(ws, { type: 'COMMAND_RESULT', command: 'REVERT_FILE', success, message: success ? `Reverted ${filePath}` : 'Failed' });
+        } else {
+            this.send(ws, { type: 'COMMAND_RESULT', command: 'REVERT_FILE', success: false, message: 'Invalid request' });
+        }
+    }
+
+    private handleGetState(ws: WebSocket) {
+        this.send(ws, {
+            type: 'COMMAND_RESULT',
+            command: 'GET_STATE',
+            success: true,
+            data: {
+                workspace: this.options.workspaceName,
+                workspacePath: this.options.workspacePath,
+                connectedClients: this.clients.size,
+                uptime: this.uptimeSeconds,
+                totalPrompts: this._totalPrompts,
+                activeTerminals: vscode.window.terminals.map(t => t.name),
+            },
+        });
+    }
+
+    private broadcastEvent(event: { type: string; payload: unknown }) {
+        const msg = JSON.stringify({
+            ...event.payload as object,
+            type: event.type,
+            workspace: this.options.workspaceName,
+        });
+
+        for (const client of this.clients) {
+            if (client.readyState === WebSocket.OPEN) {
+                client.send(msg);
+            }
+        }
     }
 
     private startStatusBroadcast() {
