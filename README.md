@@ -1,316 +1,93 @@
-<p align="center">
-  <img src="docs/assets/banner.png" alt="vstunnel" width="600" />
-</p>
+# vstunnels
 
-<h1 align="center">vstunnel</h1>
 
-<p align="center">
-  <strong>Privacy-first mobile remote control for GitHub Copilot</strong>
-</p>
 
-<p align="center">
-  <a href="#quick-start">Quick Start</a> &middot;
-  <a href="docs/USER_GUIDE.md">User Guide</a> &middot;
-  <a href="docs/DEVELOPER_GUIDE.md">Developer Guide</a> &middot;
-  <a href="docs/ARCHITECTURE.md">Architecture</a> &middot;
-  <a href="CONTRIBUTING.md">Contributing</a>
-</p>
+## Getting started
 
-<p align="center">
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT" /></a>
-  <img src="https://img.shields.io/badge/python-3.8%2B-blue.svg" alt="Python 3.8+" />
-  <img src="https://img.shields.io/badge/platform-linux%20%7C%20macos%20%7C%20windows-lightgrey.svg" alt="Platform" />
-  <img src="https://img.shields.io/badge/cost-%240%2Fmo-brightgreen.svg" alt="$0/mo" />
-</p>
+To make it easy for you to get started with GitLab, here's a list of recommended next steps.
 
----
+Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
 
-## The Problem
+## Add your files
 
-You kick off a long Copilot generation, test suite, or AI agent on your laptop. You step away. The process stalls waiting for human approval — and you don't know until you're back at your desk.
-
-## The Solution
-
-**vstunnel** is a lightweight companion that lets you monitor and send prompts to your desktop VS Code / Copilot session from any mobile browser. Your source code never leaves your machine.
+* [Create](https://docs.gitlab.com/user/project/repository/web_editor/#create-a-file) or [upload](https://docs.gitlab.com/user/project/repository/web_editor/#upload-a-file) files
+* [Add files using the command line](https://docs.gitlab.com/topics/git/add_files/#add-files-to-a-git-repository) or push an existing Git repository with the following command:
 
 ```
-Phone  ──wss://──►  GitHub Tunnel  ──►  Local Daemon  ──►  VS Code Copilot
+cd existing_repo
+git remote add origin https://code.siemens.com/ART_US/vstunnels.git
+git branch -M main
+git push -uf origin main
 ```
 
----
-
-## Key Principles
-
-| Principle | How |
-|---|---|
-| **Privacy-first** | Code never transits third-party servers. All traffic stays in your encrypted tunnel. |
-| **Zero cost** | Reuses VS Code's built-in tunnel infrastructure. No subscriptions, no cloud bills. |
-| **No native app** | Mobile UI is a static web page — no App Store, no install. |
-| **Minimal footprint** | One Python file, zero build step, two dependencies. |
-
----
-
-## Quick Start
-
-### Prerequisites
-
-- Python 3.8+
-- VS Code (any recent version with built-in port forwarding)
-- A GitHub account (for tunnel auth)
-
-### 1. Clone & install
-
-```bash
-git clone https://github.com/atodkar/vstunnel.git
-cd vstunnel
-make setup        # or: ./scripts/setup.sh
-```
-
-### 2. Start the daemon
-
-```bash
-make run          # or: ./scripts/start-daemon.sh
-```
-
-### 3. Expose via VS Code tunnel
-
-1. Open **VS Code** on your laptop.
-2. Open the **Ports** panel (`Ctrl+Shift+P` → "Ports: Focus on Ports View").
-3. Forward port **8080** and set visibility to **Public**.
-4. Copy the generated URL (e.g. `https://abcdef.githubdev.dev`).
-
-### 4. Connect from your phone
-
-1. Open the mobile UI — either locally (`frontend/index.html`) or your deployed URL.
-2. Paste the tunnel URL.
-3. Tap **Connect**. Start sending prompts.
-
----
-
-## Project Layout
-
-```
-vstunnel/
-├── extension/               # VS Code Extension (recommended for users)
-│   ├── src/extension.ts     # Extension entry point
-│   ├── src/server.ts        # Embedded WebSocket server
-│   ├── src/views/           # Sidebar panels (status, history)
-│   └── package.json         # Extension manifest
-├── backend/                 # Standalone Python Daemon (alternative)
-│   ├── daemon.py            # Async WebSocket server + workspace detection
-│   └── requirements.txt
-├── frontend/                # Mobile PWA
-│   ├── index.html           # SPA with workspace picker
-│   ├── css/styles.css       # Mobile-first responsive UI
-│   └── js/app.js            # WebSocket client + multi-instance support
-├── docs/
-│   ├── USER_GUIDE.md        # End-user step-by-step
-│   ├── DEVELOPER_GUIDE.md   # Developer onboarding
-│   ├── ARCHITECTURE.md      # Technical design
-│   ├── SCALING.md           # Scaling to many users
-│   └── DEPLOYMENT.md        # Production deployment
-├── Dockerfile
-├── docker-compose.yml
-├── Makefile
-├── CONTRIBUTING.md
-├── CHANGELOG.md
-└── LICENSE                   # MIT
-```
-
----
-
-## How It Works
-
-```
-┌──────────── INTERNET ───────────────────────────────────────────┐
-│                                                                   │
-│  [ Phone Browser ]                                               │
-│        │  wss://                                                  │
-│        ▼                                                         │
-│  [ GitHub Dev Tunnel ]  ◄── TLS 1.3, GitHub-authenticated       │
-│        │                                                         │
-└────────┼─────────────────────────────────────────────────────────┘
-         │
-┌────────▼──────── YOUR LAPTOP ────────────────────────────────────┐
-│                                                                   │
-│  [ vstunnel daemon ]  (localhost:8080)                           │
-│        │                                                         │
-│        │  subprocess: code --inline-chat "..."                   │
-│        ▼                                                         │
-│  [ VS Code + Copilot Extension ]                                │
-│                                                                   │
-└───────────────────────────────────────────────────────────────────┘
-```
+## Integrate with your tools
 
-1. The **daemon** runs a WebSocket server on `localhost:8080`.
-2. VS Code's **port forwarding** wraps it in a public TLS URL.
-3. Your **phone** connects over `wss://` through that tunnel.
-4. Prompts arrive at the daemon, which calls the VS Code CLI.
-5. Status updates stream back to the phone in real time.
+* [Set up project integrations](https://code.siemens.com/ART_US/vstunnels/-/settings/integrations)
 
-Full technical breakdown: **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**
+## Collaborate with your team
 
----
+* [Invite team members and collaborators](https://docs.gitlab.com/user/project/members/)
+* [Create a new merge request](https://docs.gitlab.com/user/project/merge_requests/creating_merge_requests/)
+* [Automatically close issues from merge requests](https://docs.gitlab.com/user/project/issues/managing_issues/#closing-issues-automatically)
+* [Enable merge request approvals](https://docs.gitlab.com/user/project/merge_requests/approvals/)
+* [Set auto-merge](https://docs.gitlab.com/user/project/merge_requests/auto_merge/)
 
-## Configuration
+## Test and Deploy
 
-Copy the example and edit as needed:
+Use the built-in continuous integration in GitLab.
 
-```bash
-cp config/.env.example config/.env
-```
+* [Get started with GitLab CI/CD](https://docs.gitlab.com/ci/quick_start/)
+* [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/user/application_security/sast/)
+* [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/topics/autodevops/requirements/)
+* [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/user/clusters/agent/)
+* [Set up protected environments](https://docs.gitlab.com/ci/environments/protected_environments/)
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `DAEMON_HOST` | `localhost` | Bind address |
-| `DAEMON_PORT` | `8080` | WebSocket listen port |
-| `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` |
+***
 
----
+# Editing this README
 
-## Deployment Options
+When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
 
-| Method | Use Case | Guide |
-|--------|----------|-------|
-| **Local** | Personal dev machine | This README |
-| **Docker** | Isolated environment | `docker compose up` |
-| **systemd** | Linux always-on | [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md#systemd-service-linux) |
-| **launchd** | macOS always-on | [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md#launchagent-macos) |
-| **Vercel** | Host mobile UI publicly | [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md#cloud-deployment) |
+## Suggestions for a good README
 
----
+Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
 
-## Health Check
+## Name
+Choose a self-explaining name for your project.
 
-The daemon exposes an HTTP health endpoint:
+## Description
+Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
 
-```bash
-curl http://localhost:8080/health
-```
+## Badges
+On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
 
-```json
-{
-  "status": "healthy",
-  "version": "1.1.0",
-  "uptime": 3600,
-  "connected_clients": 1,
-  "vscode_available": true
-}
-```
+## Visuals
+Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
 
----
+## Installation
+Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
 
-## Security
+## Usage
+Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
 
-- All traffic encrypted via TLS (GitHub tunnel infrastructure).
-- Source code **never** leaves your machine — only prompts transit.
-- No telemetry, no analytics, no tracking.
-- Tunnel URLs are authenticated via your GitHub account.
-- Daemon binds to `localhost` only — not reachable without the tunnel.
+## Support
+Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
 
-See [docs/ARCHITECTURE.md#security-model](docs/ARCHITECTURE.md#security-model) for threat analysis.
-
----
-
-## FAQ
-
-<details>
-<summary><strong>Is my source code exposed?</strong></summary>
-
-No. Only the prompt text you type on your phone travels through the tunnel. Your codebase stays on your machine.
-</details>
-
-<details>
-<summary><strong>What happens if the tunnel disconnects?</strong></summary>
-
-The mobile UI detects the drop and auto-reconnects. If the tunnel URL expired, regenerate it in VS Code's Ports panel.
-</details>
-
-<details>
-<summary><strong>Does this cost anything?</strong></summary>
-
-No. VS Code tunnels are free. The daemon runs on your existing hardware. The mobile UI can be hosted on any free static host.
-</details>
-
-<details>
-<summary><strong>Can multiple phones connect?</strong></summary>
-
-Yes. The daemon accepts multiple concurrent WebSocket connections.
-</details>
-
-<details>
-<summary><strong>Do I need GitHub Copilot?</strong></summary>
-
-Yes — the daemon triggers Copilot via VS Code's inline chat CLI. An active Copilot subscription is required.
-</details>
-
----
-
-## Two Ways to Run
-
-### Option A: VS Code Extension (Recommended for most users)
-
-One-click install, zero setup, auto-starts with VS Code:
-
-```bash
-# Install from Marketplace (coming soon)
-code --install-extension vstunnel.vstunnel
-
-# Or build from source:
-cd extension
-npm install && npm run compile
-```
-
-The extension:
-- Embeds the WebSocket server inside VS Code (no separate process)
-- Directly calls Copilot via the VS Code API (not CLI hacks)
-- Auto-forwards the port
-- Shows a QR code for instant mobile pairing
-- Handles multi-instance natively (one extension per window)
-- Supports token-based authentication
-
-### Option B: Standalone Python Daemon (Power users / self-hosters)
-
-For users who want full control or can't install extensions:
-
-```bash
-make setup && make run
-```
-
----
-
-## Scaling to Many Users
-
-vstunnel is designed to be **federated**: each user's laptop is its own server. This means:
-
-- **100 users = same infrastructure cost as 1 user ($0)**
-- Extension distributed via VS Code Marketplace (free)
-- Mobile UI hosted as static PWA on Vercel (free)
-- Optional pairing service for easy connection (~$5/mo for 50,000 users)
-
-See **[docs/SCALING.md](docs/SCALING.md)** for the full scaling architecture, revenue model, and implementation roadmap.
-
----
+## Roadmap
+If you have ideas for releases in the future, it is a good idea to list them in the README.
 
 ## Contributing
+State if you are open to contributions and what your requirements are for accepting them.
 
-We welcome contributions of all kinds. Please read **[CONTRIBUTING.md](CONTRIBUTING.md)** before submitting a PR.
+For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
 
-**Good first issues:**
-- Improve mobile UI accessibility
-- Add unit tests for the daemon
-- Support alternative VS Code forks (Cursor, VSCodium)
-- Add i18n to the frontend
-- Help publish the extension to the Marketplace
+You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
 
----
+## Authors and acknowledgment
+Show your appreciation to those who have contributed to the project.
 
 ## License
+For open source projects, say how it is licensed.
 
-[MIT](LICENSE) — free for personal and commercial use.
-
----
-
-<p align="center">
-  Built for developers who code from everywhere.
-</p>
+## Project status
+If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
