@@ -277,7 +277,7 @@ python3 --version  # Should be 3.8+
 
 # Check virtual environment
 source backend/venv/bin/activate
-python3 -c "import websockets; print(websockets.__version__)"
+python3 -c "import aiohttp; print(aiohttp.__version__)"
 
 # Check port availability
 lsof -i :8080  # Kill if needed: kill -9 <PID>

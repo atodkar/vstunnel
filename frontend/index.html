@@ -25,18 +25,45 @@
         <section id="setupPanel" class="panel setup-panel">
             <h2>Connection Setup</h2>
             <div class="form-group">
-                <label for="tunnelUrl">VS Code Tunnel URL:</label>
+                <label for="tunnelUrl">Relay Server URL:</label>
                 <input
                     type="text"
                     id="tunnelUrl"
-                    placeholder="e.g., xk7abc123-8080.use2.devtunnels.ms"
+                    placeholder="e.g., https://vstunnel.siemens.internal"
                     class="input-field"
                 >
-                <small>Get this from VS Code Ports panel</small>
+                <small>Enter the URL of your vstunnel relay server</small>
             </div>
             <button id="connectBtn" class="btn btn-primary">
-                Connect to Daemon
+                Connect
             </button>
+        </section>
+
+        <!-- User Selection Panel (relay mode) -->
+        <section id="userPanel" class="panel workspace-panel" style="display: none;">
+            <h2>Select Your Laptop</h2>
+            <p class="panel-description">Choose which registered laptop to send prompts to:</p>
+
+            <div id="userList" class="workspace-list">
+                <!-- Populated dynamically -->
+            </div>
+
+            <div class="form-group" style="margin-top: 1rem;">
+                <label for="authToken">Auth Token:</label>
+                <input
+                    type="password"
+                    id="authToken"
+                    placeholder="Paste the token shown in your daemon terminal"
+                    class="input-field"
+                >
+                <small>Get this from your laptop daemon output</small>
+            </div>
+
+            <div class="workspace-actions">
+                <button id="refreshUsersBtn" class="btn btn-secondary">
+                    Refresh List
+                </button>
+            </div>
         </section>
 
         <!-- Workspace Selector (shown after connect, before control panel) -->

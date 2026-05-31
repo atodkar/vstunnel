@@ -87,7 +87,7 @@ make setup
 This runs `scripts/setup.sh`, which does:
 1. Checks Python 3 exists
 2. Creates a virtual environment at `backend/venv/`
-3. Installs production dependencies (`websockets`, `python-dotenv`)
+3. Installs production dependencies (`aiohttp`, `python-dotenv`)
 4. Copies `config/.env.example` → `config/.env`
 
 ### 3. Install dev dependencies
@@ -113,10 +113,12 @@ Expected output:
 ```json
 {
   "status": "healthy",
-  "version": "1.1.0",
+  "version": "1.3.0",
   "uptime": 5,
   "connected_clients": 0,
-  "vscode_available": true
+  "poll_sessions": 0,
+  "vscode_available": true,
+  "transport": ["websocket", "polling"]
 }
 ```
 
@@ -152,7 +154,7 @@ vstunnel/
 ├── frontend/                    ← Phone web UI (static files)
 │   ├── index.html              ← Page structure
 │   ├── css/styles.css          ← Visual styling
-│   ├── js/app.js              ← WebSocket logic
+│   ├── js/app.js              ← Connection logic (HTTP-first + WS upgrade)
 │   ├── package.json            ← Metadata for deployment tools
 │   └── vercel.json             ← Vercel deployment config
 │
@@ -202,27 +204,34 @@ async def main():
     host = os.getenv("DAEMON_HOST", "localhost")
     state.vscode_available = check_vscode_cli()
     
-    async with websockets.serve(handle_connection, host, port, ...):
-        await state.shutdown_event.wait()
+    app = create_app()  # aiohttp app with HTTP + WebSocket routes
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, host, port)
+    await site.start()
+    await state.shutdown_event.wait()
 ```
 
 1. Reads config from environment variables
 2. Checks if `code` CLI is in PATH
-3. Starts a WebSocket server
+3. Creates an aiohttp app (serves HTTP API, WebSocket, and frontend static files)
 4. Waits forever (until SIGTERM/SIGINT)
 
-#### Connection handler (`handle_connection()`)
+#### WebSocket handler (`handle_websocket()`)
 
 ```python
-async def handle_connection(websocket):
+async def handle_websocket(request):
+    ws = web.WebSocketResponse()
+    await ws.prepare(request)
     # 1. Register client
     # 2. Send WELCOME message
-    # 3. Start background tasks (status streaming, heartbeat)
+    # 3. Start background status streaming task
     # 4. Loop: receive messages, route by type
     # 5. On disconnect: cleanup
 ```
 
-Each phone that connects gets its own instance of this function running concurrently.
+Each phone that connects via WebSocket gets its own instance of this function running concurrently.
+Phones that cannot use WebSocket use the HTTP polling API instead (`/api/connect`, `/api/poll`, `/api/send`).
 
 #### Message types the daemon understands:
 
@@ -440,10 +449,10 @@ This shows all WebSocket messages, connection events, and subprocess calls.
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
-| `ModuleNotFoundError: No module named 'websockets'` | Venv not activated | `source backend/venv/bin/activate` |
+| `ModuleNotFoundError: No module named 'aiohttp'` | Venv not activated | `source backend/venv/bin/activate` |
 | `OSError: [Errno 98] Address already in use` | Port 8080 occupied | Kill old process: `lsof -ti:8080 \| xargs kill` |
 | `code: command not found` | VS Code CLI not in PATH | Install from VS Code command palette |
-| WebSocket won't connect from browser | Mixed content (HTTP page, WSS socket) | Use `ws://` for local or serve frontend over HTTPS |
+| WebSocket won't connect from phone | Corporate device blocks ws:// | Use HTTP polling (automatic fallback in frontend) |
 | Changes not reflected | Browser cache | Hard refresh: `Ctrl+Shift+R` |
 
 ### Inspect WebSocket traffic
@@ -479,21 +488,36 @@ make docker-run
 ### Simulate a phone connection from CLI
 
 ```python
-# save as test_client.py
-import asyncio, json, websockets
+# save as test_client.py — using HTTP polling (works even when WebSocket is blocked)
+import requests, json, time
 
-async def test():
-    async with websockets.connect("ws://localhost:8080") as ws:
-        # Read welcome message
-        welcome = json.loads(await ws.recv())
-        print(f"Connected! Daemon v{welcome['version']} on {welcome['os']}")
-        
-        # Send a prompt
-        await ws.send(json.dumps({"type": "PROMPT", "payload": "Say hello"}))
-        ack = json.loads(await ws.recv())
-        print(f"Result: {ack['result']['status']}")
+BASE = "http://localhost:8080"
 
-asyncio.run(test())
+# Connect and get session
+resp = requests.get(f"{BASE}/api/connect")
+data = resp.json()
+session_id = data["session_id"]
+print(f"Connected! Daemon v{data['version']} on {data['os']}")
+print(f"Transport: {data['transport']}")
+
+# Send a prompt
+resp = requests.post(f"{BASE}/api/send",
+    headers={"X-Session-Id": session_id, "Content-Type": "application/json"},
+    json={"type": "PROMPT", "payload": "Say hello"})
+ack = resp.json()
+print(f"Result: {ack['result']['status']}")
+
+# Or use WebSocket directly (if not blocked):
+# import aiohttp, asyncio
+# async def ws_test():
+#     async with aiohttp.ClientSession() as session:
+#         async with session.ws_connect(f"ws://localhost:8080/ws") as ws:
+#             welcome = await ws.receive_json()
+#             print(f"Connected! v{welcome['version']}")
+#             await ws.send_json({"type": "PROMPT", "payload": "Say hello"})
+#             ack = await ws.receive_json()  # skip status updates
+#             print(f"Result: {ack}")
+# asyncio.run(ws_test())
 ```
 
 ### Add a new environment variable
@@ -514,12 +538,12 @@ Decisions made in this project and why:
 |----------|-----------|
 | **Vanilla JS frontend** | No build step, runs anywhere, easy to understand |
 | **Single Python file** | Low barrier to entry, easy to audit, no package structure overhead |
-| **websockets library** | Pure Python, no C extensions, works everywhere |
+| **aiohttp library** | Handles HTTP + WebSocket on one port, HTTP polling fallback for restricted networks |
 | **VS Code CLI** | Avoids needing a VS Code extension (simpler, no marketplace) |
 | **No database** | State is ephemeral and in-memory. Daemon is stateless across restarts. |
-| **No auth layer** | Tunnel URL is the "password". Adding auth is a future enhancement. |
+| **HTTP-first connection** | Corporate mobile devices often block ws:// URLs; HTTP works everywhere |
 | **Async Python** | WebSockets are I/O bound; async handles many connections on one thread |
-| **No TypeScript** | Frontend is small (~200 lines). Types would add build complexity for little gain. |
+| **No TypeScript** | Frontend is small (~300 lines). Types would add build complexity for little gain. |
 
 ### Things intentionally NOT included (and why):
 

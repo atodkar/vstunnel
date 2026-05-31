@@ -3,7 +3,7 @@
 vstunnel Copilot Daemon - Local WebSocket Server
 Manages connections from mobile UI and executes prompts in VS Code.
 Supports multiple VS Code instances via workspace detection and targeting.
-Provides health check HTTP endpoint alongside the WebSocket service.
+Serves mobile UI via HTTP and provides HTTP polling fallback when WebSocket is blocked.
 """
 
 import asyncio
@@ -15,11 +15,12 @@ import platform
 import shutil
 import subprocess
 import sys
+import uuid
 from datetime import datetime, timezone
-from http import HTTPStatus
 from pathlib import Path
 
-import websockets
+import aiohttp
+from aiohttp import web
 import logging
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -30,10 +31,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger("vstunnel")
 
-DAEMON_VERSION = "1.2.0"
+DAEMON_VERSION = "1.4.0"
 MAX_PROMPT_LENGTH = 10_000
 HEARTBEAT_INTERVAL = 20
 STATUS_INTERVAL = 3
+POLL_SESSION_TIMEOUT = 120
+FRONTEND_DIR = Path(__file__).parent.parent / "frontend"
 
 
 # ─── Workspace Detection ───────────────────────────────────────────────────────
@@ -295,6 +298,7 @@ class DaemonState:
         self.vscode_available: bool = False
         self.shutdown_event: asyncio.Event = asyncio.Event()
         self.workspace_manager: WorkspaceManager = WorkspaceManager()
+        self.poll_sessions: dict = {}  # session_id -> PollSession
 
     @property
     def uptime_seconds(self) -> int:
@@ -312,6 +316,45 @@ class DaemonState:
         if len(self.prompt_history) > 50:
             self.prompt_history = self.prompt_history[-50:]
         self.total_prompts_executed += 1
+
+    def create_poll_session(self) -> str:
+        session_id = uuid.uuid4().hex[:16]
+        self.poll_sessions[session_id] = {
+            "created": datetime.now(timezone.utc),
+            "last_poll": datetime.now(timezone.utc),
+            "messages": [],
+        }
+        return session_id
+
+    def get_poll_session(self, session_id: str) -> dict | None:
+        session = self.poll_sessions.get(session_id)
+        if session:
+            session["last_poll"] = datetime.now(timezone.utc)
+        return session
+
+    def queue_poll_message(self, session_id: str, message: dict):
+        session = self.poll_sessions.get(session_id)
+        if session:
+            session["messages"].append(message)
+            if len(session["messages"]) > 100:
+                session["messages"] = session["messages"][-100:]
+
+    def drain_poll_messages(self, session_id: str) -> list:
+        session = self.poll_sessions.get(session_id)
+        if not session:
+            return []
+        messages = session["messages"]
+        session["messages"] = []
+        return messages
+
+    def cleanup_stale_sessions(self):
+        now = datetime.now(timezone.utc)
+        stale = [
+            sid for sid, s in self.poll_sessions.items()
+            if (now - s["last_poll"]).total_seconds() > POLL_SESSION_TIMEOUT
+        ]
+        for sid in stale:
+            del self.poll_sessions[sid]
 
 
 state = DaemonState()
@@ -390,182 +433,425 @@ async def execute_vscode_command(prompt: str, workspace_folder: str = None) -> d
         }
 
 
-# ─── WebSocket Handlers ────────────────────────────────────────────────────────
+# ─── HTTP + WebSocket Server (aiohttp) ───────────────────────────────────────
 
 
-async def stream_status(websocket):
-    """Push periodic status updates to connected mobile clients."""
+CORS_HEADERS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, X-Session-Id",
+}
+
+
+async def handle_cors(request):
+    return web.Response(status=204, headers=CORS_HEADERS)
+
+
+async def handle_health(request):
+    return web.json_response({
+        "status": "healthy",
+        "version": DAEMON_VERSION,
+        "uptime": state.uptime_seconds,
+        "connected_clients": len(state.connected_clients),
+        "poll_sessions": len(state.poll_sessions),
+        "vscode_available": state.vscode_available,
+        "transport": ["websocket", "polling"],
+    }, headers=CORS_HEADERS)
+
+
+async def handle_api_connect(request):
+    state.cleanup_stale_sessions()
+    session_id = state.create_poll_session()
+    workspaces = await state.workspace_manager.detect_workspaces()
+    return web.json_response({
+        "type": "WELCOME",
+        "session_id": session_id,
+        "version": DAEMON_VERSION,
+        "os": platform.system(),
+        "vscode_available": state.vscode_available,
+        "workspaces": workspaces,
+        "transport": "polling",
+        "poll_interval_ms": 2000,
+        "timestamp": datetime.now(timezone.utc).isoformat() + "Z",
+    }, headers=CORS_HEADERS)
+
+
+async def handle_api_poll(request):
+    session_id = request.headers.get("X-Session-Id") or request.query.get("session")
+
+    if not session_id or not state.get_poll_session(session_id):
+        return web.json_response(
+            {"type": "ERROR", "message": "Invalid or expired session"},
+            status=401, headers=CORS_HEADERS,
+        )
+
+    messages = state.drain_poll_messages(session_id)
+
+    workspaces = await state.workspace_manager.detect_workspaces()
+    status_msg = {
+        "type": "STATUS_UPDATE",
+        "status": "READY_AND_LISTENING",
+        "timestamp": datetime.now(timezone.utc).isoformat() + "Z",
+        "os": platform.system(),
+        "version": DAEMON_VERSION,
+        "connected_clients": len(state.connected_clients) + len(state.poll_sessions),
+        "uptime": state.uptime_seconds,
+        "total_prompts": state.total_prompts_executed,
+        "vscode_available": state.vscode_available,
+        "workspaces": workspaces,
+    }
+    messages.append(status_msg)
+
+    return web.json_response({"messages": messages}, headers=CORS_HEADERS)
+
+
+async def handle_api_send(request):
+    session_id = request.headers.get("X-Session-Id") or request.query.get("session")
+
+    if not session_id or not state.get_poll_session(session_id):
+        return web.json_response(
+            {"type": "ERROR", "message": "Invalid or expired session"},
+            status=401, headers=CORS_HEADERS,
+        )
+
     try:
-        while True:
-            workspaces = await state.workspace_manager.detect_workspaces()
-            packet = {
-                "type": "STATUS_UPDATE",
-                "status": "READY_AND_LISTENING",
-                "timestamp": datetime.now(timezone.utc).isoformat() + "Z",
-                "os": platform.system(),
-                "version": DAEMON_VERSION,
-                "connected_clients": len(state.connected_clients),
-                "uptime": state.uptime_seconds,
-                "total_prompts": state.total_prompts_executed,
-                "vscode_available": state.vscode_available,
-                "workspaces": workspaces,
-            }
-            await websocket.send(json.dumps(packet))
-            await asyncio.sleep(STATUS_INTERVAL)
-    except websockets.exceptions.ConnectionClosed:
-        pass
+        data = await request.json()
+    except (json.JSONDecodeError, Exception):
+        return web.json_response(
+            {"type": "ERROR", "message": "Invalid JSON body"},
+            status=400, headers=CORS_HEADERS,
+        )
+
+    msg_type = data.get("type")
+
+    if msg_type == "PROMPT":
+        prompt_text = data.get("payload", "").strip()
+        workspace_id = data.get("workspace_id")
+
+        if not prompt_text:
+            return web.json_response({"type": "ERROR", "message": "Empty prompt"}, status=400, headers=CORS_HEADERS)
+        if len(prompt_text) > MAX_PROMPT_LENGTH:
+            return web.json_response(
+                {"type": "ERROR", "message": f"Prompt exceeds {MAX_PROMPT_LENGTH} characters"},
+                status=400, headers=CORS_HEADERS,
+            )
+
+        workspace_folder = None
+        workspace_name = None
+        if workspace_id:
+            workspace_folder = await state.workspace_manager.resolve_folder(workspace_id)
+            if workspace_folder:
+                workspace_name = Path(workspace_folder).name
+
+        result = await execute_vscode_command(prompt_text, workspace_folder)
+        state.record_prompt(prompt_text, result, workspace_name)
+
+        response = {
+            "type": "PROMPT_ACK",
+            "result": result,
+            "workspace": workspace_name,
+            "timestamp": datetime.now(timezone.utc).isoformat() + "Z",
+        }
+        state.queue_poll_message(session_id, response)
+        return web.json_response(response, headers=CORS_HEADERS)
+
+    elif msg_type == "LIST_WORKSPACES":
+        workspaces = await state.workspace_manager.detect_workspaces()
+        response = {
+            "type": "WORKSPACES",
+            "workspaces": workspaces,
+            "timestamp": datetime.now(timezone.utc).isoformat() + "Z",
+        }
+        return web.json_response(response, headers=CORS_HEADERS)
+
+    elif msg_type == "HISTORY":
+        response = {
+            "type": "HISTORY_RESPONSE",
+            "history": state.prompt_history[-20:],
+        }
+        return web.json_response(response, headers=CORS_HEADERS)
+
+    elif msg_type == "REGISTER_WORKSPACE":
+        folder_path = data.get("folder_path", "").strip()
+        if folder_path:
+            result = state.workspace_manager.register_manual(folder_path)
+            if result:
+                return web.json_response({"type": "WORKSPACE_REGISTERED", "workspace": result}, headers=CORS_HEADERS)
+        return web.json_response({"type": "ERROR", "message": "Invalid folder path"}, status=400, headers=CORS_HEADERS)
+
+    return web.json_response({"type": "ERROR", "message": f"Unknown message type: {msg_type}"}, status=400, headers=CORS_HEADERS)
 
 
-async def heartbeat(websocket):
-    """Send periodic pings to detect stale connections."""
-    try:
-        while True:
-            await asyncio.sleep(HEARTBEAT_INTERVAL)
-            pong = await websocket.ping()
-            await asyncio.wait_for(pong, timeout=10)
-    except (asyncio.TimeoutError, websockets.exceptions.ConnectionClosed):
-        pass
+async def handle_websocket(request):
+    """WebSocket handler for aiohttp - wraps existing logic."""
+    ws = web.WebSocketResponse()
+    await ws.prepare(request)
 
+    remote = request.remote
+    logger.info(f"WebSocket client connected: {remote}")
+    state.connected_clients.add(ws)
 
-async def handle_connection(websocket):
-    """Manage a single WebSocket client session."""
-    remote = websocket.remote_address
-    logger.info(f"Client connected: {remote}")
-    state.connected_clients.add(websocket)
+    async def ws_send(data):
+        await ws.send_str(json.dumps(data))
 
-    status_task = asyncio.create_task(stream_status(websocket))
-    heartbeat_task = asyncio.create_task(heartbeat(websocket))
+    async def ws_stream_status():
+        try:
+            while not ws.closed:
+                workspaces = await state.workspace_manager.detect_workspaces()
+                packet = {
+                    "type": "STATUS_UPDATE",
+                    "status": "READY_AND_LISTENING",
+                    "timestamp": datetime.now(timezone.utc).isoformat() + "Z",
+                    "os": platform.system(),
+                    "version": DAEMON_VERSION,
+                    "connected_clients": len(state.connected_clients) + len(state.poll_sessions),
+                    "uptime": state.uptime_seconds,
+                    "total_prompts": state.total_prompts_executed,
+                    "vscode_available": state.vscode_available,
+                    "workspaces": workspaces,
+                }
+                await ws_send(packet)
+                await asyncio.sleep(STATUS_INTERVAL)
+        except Exception:
+            pass
+
+    status_task = asyncio.create_task(ws_stream_status())
 
     try:
         workspaces = await state.workspace_manager.detect_workspaces()
-        welcome = {
+        await ws_send({
             "type": "WELCOME",
             "version": DAEMON_VERSION,
             "os": platform.system(),
             "vscode_available": state.vscode_available,
             "workspaces": workspaces,
             "timestamp": datetime.now(timezone.utc).isoformat() + "Z",
-        }
-        await websocket.send(json.dumps(welcome))
+        })
 
-        async for message in websocket:
-            try:
-                data = json.loads(message)
-            except json.JSONDecodeError:
-                await websocket.send(json.dumps({
-                    "type": "ERROR",
-                    "message": "Invalid JSON",
-                }))
-                continue
-
-            msg_type = data.get("type")
-
-            if msg_type == "PROMPT":
-                prompt_text = data.get("payload", "").strip()
-                workspace_id = data.get("workspace_id")
-
-                if not prompt_text:
-                    await websocket.send(json.dumps({
-                        "type": "ERROR",
-                        "message": "Empty prompt",
-                    }))
+        async for msg in ws:
+            if msg.type == web.WSMsgType.TEXT:
+                try:
+                    data = json.loads(msg.data)
+                except json.JSONDecodeError:
+                    await ws_send({"type": "ERROR", "message": "Invalid JSON"})
                     continue
 
-                if len(prompt_text) > MAX_PROMPT_LENGTH:
-                    await websocket.send(json.dumps({
-                        "type": "ERROR",
-                        "message": f"Prompt exceeds {MAX_PROMPT_LENGTH} characters",
-                    }))
-                    continue
+                msg_type = data.get("type")
 
-                workspace_folder = None
-                workspace_name = None
-                if workspace_id:
-                    workspace_folder = await state.workspace_manager.resolve_folder(workspace_id)
-                    if workspace_folder:
-                        workspace_name = Path(workspace_folder).name
-                        logger.info(f"Targeting workspace: {workspace_name}")
-                    else:
-                        logger.warning(f"Workspace ID '{workspace_id}' not found, using default")
+                if msg_type == "PROMPT":
+                    prompt_text = data.get("payload", "").strip()
+                    workspace_id = data.get("workspace_id")
 
-                logger.info(f"Received prompt ({len(prompt_text)} chars): {prompt_text[:60]}...")
-                result = await execute_vscode_command(prompt_text, workspace_folder)
-                state.record_prompt(prompt_text, result, workspace_name)
+                    if not prompt_text:
+                        await ws_send({"type": "ERROR", "message": "Empty prompt"})
+                        continue
+                    if len(prompt_text) > MAX_PROMPT_LENGTH:
+                        await ws_send({"type": "ERROR", "message": f"Prompt exceeds {MAX_PROMPT_LENGTH} characters"})
+                        continue
 
-                response = {
-                    "type": "PROMPT_ACK",
-                    "result": result,
-                    "workspace": workspace_name,
-                    "timestamp": datetime.now(timezone.utc).isoformat() + "Z",
-                }
-                await websocket.send(json.dumps(response))
+                    workspace_folder = None
+                    workspace_name = None
+                    if workspace_id:
+                        workspace_folder = await state.workspace_manager.resolve_folder(workspace_id)
+                        if workspace_folder:
+                            workspace_name = Path(workspace_folder).name
 
-            elif msg_type == "PING":
-                await websocket.send(json.dumps({
-                    "type": "PONG",
-                    "timestamp": datetime.now(timezone.utc).isoformat() + "Z",
-                }))
+                    result = await execute_vscode_command(prompt_text, workspace_folder)
+                    state.record_prompt(prompt_text, result, workspace_name)
+                    await ws_send({
+                        "type": "PROMPT_ACK",
+                        "result": result,
+                        "workspace": workspace_name,
+                        "timestamp": datetime.now(timezone.utc).isoformat() + "Z",
+                    })
 
-            elif msg_type == "LIST_WORKSPACES":
-                workspaces = await state.workspace_manager.detect_workspaces()
-                await websocket.send(json.dumps({
-                    "type": "WORKSPACES",
-                    "workspaces": workspaces,
-                    "timestamp": datetime.now(timezone.utc).isoformat() + "Z",
-                }))
+                elif msg_type == "PING":
+                    await ws_send({"type": "PONG", "timestamp": datetime.now(timezone.utc).isoformat() + "Z"})
 
-            elif msg_type == "REGISTER_WORKSPACE":
-                folder_path = data.get("folder_path", "").strip()
-                if folder_path:
-                    result = state.workspace_manager.register_manual(folder_path)
-                    if result:
-                        await websocket.send(json.dumps({
-                            "type": "WORKSPACE_REGISTERED",
-                            "workspace": result,
-                        }))
-                    else:
-                        await websocket.send(json.dumps({
-                            "type": "ERROR",
-                            "message": f"Invalid folder path: {folder_path}",
-                        }))
+                elif msg_type == "LIST_WORKSPACES":
+                    workspaces = await state.workspace_manager.detect_workspaces()
+                    await ws_send({"type": "WORKSPACES", "workspaces": workspaces, "timestamp": datetime.now(timezone.utc).isoformat() + "Z"})
 
-            elif msg_type == "HISTORY":
-                await websocket.send(json.dumps({
-                    "type": "HISTORY_RESPONSE",
-                    "history": state.prompt_history[-20:],
-                }))
+                elif msg_type == "REGISTER_WORKSPACE":
+                    folder_path = data.get("folder_path", "").strip()
+                    if folder_path:
+                        result = state.workspace_manager.register_manual(folder_path)
+                        if result:
+                            await ws_send({"type": "WORKSPACE_REGISTERED", "workspace": result})
+                        else:
+                            await ws_send({"type": "ERROR", "message": f"Invalid folder path: {folder_path}"})
 
-            else:
-                await websocket.send(json.dumps({
-                    "type": "ERROR",
-                    "message": f"Unknown message type: {msg_type}",
-                }))
+                elif msg_type == "HISTORY":
+                    await ws_send({"type": "HISTORY_RESPONSE", "history": state.prompt_history[-20:]})
 
-    except websockets.exceptions.ConnectionClosed:
-        logger.info(f"Client disconnected: {remote}")
+                else:
+                    await ws_send({"type": "ERROR", "message": f"Unknown message type: {msg_type}"})
+
+            elif msg.type == web.WSMsgType.ERROR:
+                logger.error(f"WebSocket error: {ws.exception()}")
+
     except Exception as e:
-        logger.error(f"Connection error ({remote}): {e}")
+        logger.error(f"WebSocket connection error ({remote}): {e}")
     finally:
-        state.connected_clients.discard(websocket)
+        state.connected_clients.discard(ws)
         status_task.cancel()
-        heartbeat_task.cancel()
+        logger.info(f"WebSocket client disconnected: {remote}")
+
+    return ws
 
 
-# ─── HTTP Health Check ─────────────────────────────────────────────────────────
+def create_app() -> web.Application:
+    app = web.Application()
+
+    app.router.add_route("OPTIONS", "/{path:.*}", handle_cors)
+
+    app.router.add_get("/health", handle_health)
+    app.router.add_get("/api/connect", handle_api_connect)
+    app.router.add_get("/api/poll", handle_api_poll)
+    app.router.add_post("/api/send", handle_api_send)
+
+    app.router.add_get("/ws", handle_websocket)
+
+    if FRONTEND_DIR.is_dir():
+        async def serve_index(request):
+            return web.FileResponse(FRONTEND_DIR / "index.html")
+
+        app.router.add_get("/", serve_index)
+        app.router.add_static("/css", FRONTEND_DIR / "css")
+        app.router.add_static("/js", FRONTEND_DIR / "js")
+
+    return app
 
 
-async def health_check(path, request_headers):
-    """HTTP health check endpoint at /health."""
-    if path == "/health":
-        body = json.dumps({
-            "status": "healthy",
-            "version": DAEMON_VERSION,
-            "uptime": state.uptime_seconds,
-            "connected_clients": len(state.connected_clients),
-            "vscode_available": state.vscode_available,
-        }).encode()
-        return HTTPStatus.OK, [("Content-Type", "application/json")], body
-    return None
+# ─── Relay Client Mode ────────────────────────────────────────────────────────
+
+
+async def handle_relay_message(data: dict) -> dict:
+    """Process a message forwarded from the relay and return a response."""
+    msg_type = data.get("type")
+    request_id = data.get("_relay_request_id")
+
+    if msg_type == "PROMPT":
+        prompt_text = data.get("payload", "").strip()
+        workspace_id = data.get("workspace_id")
+
+        if not prompt_text:
+            return {"type": "RESPONSE", "result": {"status": "ERROR", "message": "Empty prompt"}, "_relay_request_id": request_id}
+        if len(prompt_text) > MAX_PROMPT_LENGTH:
+            return {"type": "RESPONSE", "result": {"status": "ERROR", "message": f"Prompt exceeds {MAX_PROMPT_LENGTH} chars"}, "_relay_request_id": request_id}
+
+        workspace_folder = None
+        workspace_name = None
+        if workspace_id:
+            workspace_folder = await state.workspace_manager.resolve_folder(workspace_id)
+            if workspace_folder:
+                workspace_name = Path(workspace_folder).name
+
+        result = await execute_vscode_command(prompt_text, workspace_folder)
+        state.record_prompt(prompt_text, result, workspace_name)
+
+        return {
+            "type": "RESPONSE",
+            "result": result,
+            "workspace": workspace_name,
+            "timestamp": datetime.now(timezone.utc).isoformat() + "Z",
+            "_relay_request_id": request_id,
+        }
+
+    elif msg_type == "LIST_WORKSPACES":
+        workspaces = await state.workspace_manager.detect_workspaces()
+        return {
+            "type": "RESPONSE",
+            "workspaces": workspaces,
+            "timestamp": datetime.now(timezone.utc).isoformat() + "Z",
+            "_relay_request_id": request_id,
+        }
+
+    elif msg_type == "HISTORY":
+        return {
+            "type": "RESPONSE",
+            "history": state.prompt_history[-20:],
+            "_relay_request_id": request_id,
+        }
+
+    return {"type": "RESPONSE", "error": f"Unknown: {msg_type}", "_relay_request_id": request_id}
+
+
+async def relay_client_loop(relay_url: str, user_id: str):
+    """Connect to relay server and handle forwarded messages from phones."""
+    ws_url = relay_url.replace("https://", "wss://").replace("http://", "ws://")
+    ws_url = ws_url.rstrip("/") + "/ws/laptop"
+
+    reconnect_delay = 2
+
+    while not state.shutdown_event.is_set():
+        try:
+            async with aiohttp.ClientSession() as session:
+                logger.info(f"Connecting to relay: {ws_url}")
+                async with session.ws_connect(ws_url, heartbeat=30) as ws:
+                    reconnect_delay = 2
+
+                    workspaces = await state.workspace_manager.detect_workspaces()
+                    await ws.send_json({
+                        "type": "REGISTER",
+                        "user_id": user_id,
+                        "workspaces": [w if isinstance(w, dict) else w.to_dict() for w in workspaces],
+                    })
+
+                    reg_msg = await ws.receive_json()
+                    if reg_msg.get("type") == "REGISTERED":
+                        token = reg_msg.get("token", "")
+                        logger.info(f"Registered with relay as '{user_id}'")
+                        logger.info(f"Phone auth token: {token}")
+                        logger.info(f"Share this with your phone to connect:")
+                        logger.info(f"  User ID: {user_id}")
+                        logger.info(f"  Token:   {token}")
+                    else:
+                        logger.error(f"Registration failed: {reg_msg}")
+                        await asyncio.sleep(5)
+                        continue
+
+                    workspace_update_task = asyncio.create_task(
+                        _periodic_workspace_update(ws)
+                    )
+
+                    try:
+                        async for msg in ws:
+                            if msg.type == aiohttp.WSMsgType.TEXT:
+                                data = json.loads(msg.data)
+                                response = await handle_relay_message(data)
+                                await ws.send_json(response)
+                            elif msg.type == aiohttp.WSMsgType.ERROR:
+                                logger.error(f"Relay WS error: {ws.exception()}")
+                                break
+                            elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSING, aiohttp.WSMsgType.CLOSED):
+                                break
+                    finally:
+                        workspace_update_task.cancel()
+
+        except aiohttp.ClientError as e:
+            logger.warning(f"Relay connection failed: {e}")
+        except Exception as e:
+            logger.error(f"Relay error: {e}")
+
+        if not state.shutdown_event.is_set():
+            logger.info(f"Reconnecting to relay in {reconnect_delay}s...")
+            await asyncio.sleep(reconnect_delay)
+            reconnect_delay = min(reconnect_delay * 2, 30)
+
+
+async def _periodic_workspace_update(ws):
+    """Send workspace updates to relay periodically."""
+    try:
+        while True:
+            await asyncio.sleep(30)
+            workspaces = await state.workspace_manager.detect_workspaces()
+            await ws.send_json({
+                "type": "UPDATE_WORKSPACES",
+                "workspaces": [w if isinstance(w, dict) else w.to_dict() for w in workspaces],
+            })
+    except Exception:
+        pass
 
 
 # ─── Main Entry Point ──────────────────────────────────────────────────────────
@@ -574,14 +860,14 @@ async def health_check(path, request_headers):
 async def main():
     port = int(os.getenv("DAEMON_PORT", "8080"))
     host = os.getenv("DAEMON_HOST", "localhost")
+    relay_url = os.getenv("RELAY_URL", "").strip()
+    user_id = os.getenv("RELAY_USER_ID", "").strip() or os.getenv("USER", "").strip() or "developer"
 
     state.vscode_available = check_vscode_cli()
 
     logger.info(f"vstunnel Daemon v{DAEMON_VERSION}")
-    logger.info(f"Listening on {host}:{port}")
     logger.info(f"VS Code CLI: {'available' if state.vscode_available else 'NOT FOUND'}")
     logger.info(f"Multi-instance support: enabled")
-    logger.info(f"Next: Forward port {port} in VS Code Ports panel (set visibility to Public)")
 
     if not state.vscode_available:
         logger.warning("VS Code CLI not in PATH — prompts will fail until 'code' is available")
@@ -599,19 +885,33 @@ async def main():
         for sig in (signal.SIGTERM, signal.SIGINT):
             loop.add_signal_handler(sig, state.shutdown_event.set)
 
-    async with websockets.serve(
-        handle_connection,
-        host,
-        port,
-        process_request=health_check,
-        ping_interval=None,
-    ):
+    if relay_url:
+        # ── Relay client mode ──
+        logger.info(f"Mode: RELAY CLIENT → {relay_url}")
+        logger.info(f"User ID: {user_id}")
+        await relay_client_loop(relay_url, user_id)
+    else:
+        # ── Standalone server mode ──
+        logger.info(f"Mode: STANDALONE SERVER")
+        logger.info(f"HTTP + WebSocket on http://{host}:{port}")
+        logger.info(f"Mobile UI served at http://{host}:{port}/")
+
+        app = create_app()
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, host, port)
+        await site.start()
+
         logger.info("Daemon ready. Waiting for connections...")
         await state.shutdown_event.wait()
 
-    logger.info("Shutting down gracefully...")
-    for ws in list(state.connected_clients):
-        await ws.close(1001, "Server shutting down")
+        logger.info("Shutting down gracefully...")
+        for ws in list(state.connected_clients):
+            try:
+                await ws.close()
+            except Exception:
+                pass
+        await runner.cleanup()
 
 
 if __name__ == "__main__":
