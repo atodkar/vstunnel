@@ -1,374 +1,212 @@
-# vstunnel - Deployment Guide
+# Deployment Guide
 
-Complete guide for deploying vstunnel in different environments.
-
-## Local Development
-
-### Prerequisites
-- Python 3.8+
-- VS Code with Remote Tunnels (built-in)
-- Git
-
-### Installation Steps
-
-```bash
-# 1. Clone/download vstunnel
-git clone https://github.com/yourusername/vstunnel.git
-cd vstunnel
-
-# 2. Run setup script
-chmod +x scripts/*.sh
-./scripts/setup.sh
-
-# 3. Start the daemon
-./scripts/start-daemon.sh
-
-# Output should show:
-# 🚀 vstunnel Daemon v1.0.0
-# 📡 Running on localhost:8080
-# 👉 Next: Forward port 8080 via VS Code Ports panel
-```
-
-### VS Code Port Forwarding
-
-1. Open VS Code
-2. Terminal → Ports (or Cmd+Shift+P → Forward a Port)
-3. Enter port: `8080`
-4. Right-click entry → Set Label: "vstunnel"
-5. Right-click entry → Port Visibility → Public
-6. Copy generated URL
-
-### Mobile Connection
-
-1. Open mobile browser
-2. Navigate to `file:///path/to/vstunnel/frontend/index.html`
-   - Or deploy to Vercel (see cloud deployment)
-3. Paste tunnel URL (format: `abc123.githubdev.dev`)
-4. Click "Connect to Daemon"
-5. Start sending prompts!
+Production deployment for vstunnel.
 
 ---
 
-## Docker Deployment
+## Overview
 
-### Dockerfile
+vstunnel has three components to deploy:
 
-```dockerfile
-FROM python:3.11-slim
-
-WORKDIR /app
-
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
-    build-essential \
-    && rm -rf /var/lib/apt/lists/*
-
-# Copy application
-COPY backend/requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-COPY backend/daemon.py .
-COPY config/.env .env
-
-# Expose port
-EXPOSE 8080
-
-# Run daemon
-CMD ["python3", "daemon.py"]
-```
-
-### Build and Run
-
-```bash
-# Build image
-docker build -t vstunnel:latest .
-
-# Run container with port mapping
-docker run -p 8080:8080 \
-  -e DAEMON_HOST=0.0.0.0 \
-  -e DAEMON_PORT=8080 \
-  vstunnel:latest
-
-# Or use docker-compose
-docker-compose up -d
-```
-
-### docker-compose.yml
-
-```yaml
-version: '3.8'
-
-services:
-  vstunnel:
-    build: .
-    ports:
-      - "8080:8080"
-    environment:
-      DAEMON_HOST: 0.0.0.0
-      DAEMON_PORT: 8080
-      LOG_LEVEL: INFO
-    restart: unless-stopped
-    volumes:
-      - ./config/.env:/app/.env:ro
-```
+| Component | Where | How |
+|-----------|-------|-----|
+| Relay Server | Corporate VM / data center | Docker container |
+| VS Code Extension | Each developer's laptop | .vsix install |
+| Mobile UI | Served by relay at `/` | No separate deploy needed |
 
 ---
 
-## Cloud Deployment
+## 1. Relay Server Deployment
 
-### Frontend on Vercel/Netlify
-
-**Vercel Deployment:**
+### Docker (recommended)
 
 ```bash
-# 1. Install Vercel CLI
-npm install -g vercel
+# Build from project root
+docker build -f relay/Dockerfile -t vstunnel-relay .
 
-# 2. Deploy frontend
-cd frontend
-vercel deploy --prod
+# Run
+docker run -d \
+  --name vstunnel-relay \
+  --restart unless-stopped \
+  -p 8080:8080 \
+  -e LOG_LEVEL=INFO \
+  vstunnel-relay
 
-# 3. Your frontend now at: https://vstunnel.vercel.app
+# Verify
+curl http://localhost:8080/health
 ```
 
-**vercel.json** (in frontend root):
-```json
-{
-  "buildCommand": "exit 0",
-  "outputDirectory": "."
+Or using docker-compose:
+
+```bash
+cd relay/
+docker compose up -d
+```
+
+### Behind nginx (TLS termination)
+
+For HTTPS access (recommended for production):
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name vstunnel.siemens.internal;
+
+    ssl_certificate     /etc/ssl/certs/vstunnel.pem;
+    ssl_certificate_key /etc/ssl/private/vstunnel.key;
+
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_read_timeout 86400;
+    }
 }
 ```
 
-### Backend Considerations
+Then configure DNS: `vstunnel.siemens.internal → <VM IP>`
 
-**Important**: The daemon should ONLY run on your local machine. Never expose it to the internet.
+### Environment Variables
 
-- ❌ Do NOT deploy daemon to cloud
-- ✅ Do run daemon locally behind VS Code tunnels
-- ✅ Do deploy frontend to CDN/static hosting
-- ✅ Tunnel provides secure relay without exposing daemon
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `RELAY_PORT` | `8080` | Listen port |
+| `RELAY_HOST` | `0.0.0.0` | Bind address |
+| `LOG_LEVEL` | `INFO` | DEBUG, INFO, WARNING, ERROR |
+| `FRONTEND_DIR` | `../frontend` | Path to mobile UI static files |
 
----
+### Health Check
 
-## Systemd Service (Linux)
-
-Create `/etc/systemd/user/vstunnel.service`:
-
-```ini
-[Unit]
-Description=vstunnel Copilot Daemon
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-WorkingDirectory=/home/username/vstunnel
-Environment="PATH=/home/username/vstunnel/backend/venv/bin:/usr/local/bin:/usr/bin"
-ExecStart=/home/username/vstunnel/scripts/start-daemon.sh
-Restart=on-failure
-RestartSec=10
-
-[Install]
-WantedBy=default.target
+```bash
+curl http://localhost:8080/health
 ```
 
-**Enable and start:**
-```bash
-systemctl --user enable vstunnel
-systemctl --user start vstunnel
+Returns:
+```json
+{
+  "status": "healthy",
+  "version": "2.0.0",
+  "uptime": 3600,
+  "registered_users": 3,
+  "registered_instances": 5,
+  "poll_sessions": 1,
+  "total_prompts": 42
+}
+```
 
-# Check status
-systemctl --user status vstunnel
+### Firewall Rules
 
-# View logs
-journalctl --user -u vstunnel -f
+```
+Inbound:  Port 443 (or 8080) from VPN CIDR
+Outbound: None required
 ```
 
 ---
 
-## LaunchAgent (macOS)
+## 2. VS Code Extension Installation
 
-Create `~/Library/LaunchAgents/com.vstunnel.daemon.plist`:
+### From .vsix package
 
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.vstunnel.daemon</string>
-    
-    <key>ProgramArguments</key>
-    <array>
-        <string>/Users/username/vstunnel/scripts/start-daemon.sh</string>
-    </array>
-    
-    <key>WorkingDirectory</key>
-    <string>/Users/username/vstunnel</string>
-    
-    <key>RunAtLoad</key>
-    <true/>
-    
-    <key>KeepAlive</key>
-    <true/>
-    
-    <key>StandardOutPath</key>
-    <string>/tmp/vstunnel.log</string>
-    
-    <key>StandardErrorPath</key>
-    <string>/tmp/vstunnel.err</string>
-</dict>
-</plist>
-```
-
-**Install and start:**
 ```bash
-launchctl load ~/Library/LaunchAgents/com.vstunnel.daemon.plist
+# Build the package
+cd extension/
+npm install
+npm run compile
+npx vsce package
+# Output: vstunnel-2.0.0.vsix
 
-# Check status
-launchctl list | grep vstunnel
-
-# View logs
-tail -f /tmp/vstunnel.log
+# Install
+code --install-extension vstunnel-2.0.0.vsix
 ```
+
+### From source (dev install)
+
+```bash
+cd extension/
+npm install
+npm run compile
+```
+
+Then in VS Code: `Ctrl+Shift+P` → "Developer: Install Extension from Location..." → select `extension/` folder.
+
+### Configuration
+
+After installing, open VS Code Settings (`Ctrl+,`) and set:
+
+```json
+{
+  "vstunnel.relayUrl": "http://vstunnel.siemens.internal:8080",
+  "vstunnel.userId": "z003vsvd",
+  "vstunnel.autoStart": true
+}
+```
+
+Or via `Ctrl+Shift+P` → "Preferences: Open Settings (JSON)".
+
+### Verify
+
+1. `Ctrl+Shift+P` → "vstunnel: Start Mobile Bridge"
+2. Check Output panel (select "vstunnel" channel)
+3. Should show: `Connected to relay` and auth token
 
 ---
 
-## Windows Deployment
+## 3. Mobile UI
 
-### Using Task Scheduler
+The mobile UI is **served by the relay server** at the root path `/`. No separate deployment is needed.
 
-**Create start script** `vstunnel-start.vbs`:
-```vbscript
-Set objWshShell = CreateObject("WScript.Shell")
-objWshShell.Run "cmd.exe /c cd C:\Users\YourName\vstunnel && venv\Scripts\python.exe backend\daemon.py", 0
-```
+When you deploy the relay Docker container, the frontend files are bundled inside and served automatically.
 
-**Create Task:**
-1. Open Task Scheduler
-2. Create Basic Task → Name: "vstunnel Daemon"
-3. Trigger: "At startup"
-4. Action: Start program → `vstunnel-start.vbs`
-5. Options: ✓ Run whether user is logged in or not
+**Accessing:** Open `http://<relay-host>:8080/` (or `https://vstunnel.siemens.internal/` with nginx) on any browser.
 
 ---
 
-## Production Checklist
+## Multi-User Setup
 
-- [ ] Dependencies installed via requirements.txt
-- [ ] Environment variables configured in .env
-- [ ] Port 8080 available (or configured alternative)
-- [ ] VS Code tunnel forward created and verified
-- [ ] Frontend deployed to CDN (if using remote)
-- [ ] Daemon started and listening
-- [ ] Mobile device can reach tunnel URL
-- [ ] Test prompt execution end-to-end
-- [ ] Logs monitored for errors
-- [ ] Auto-restart configured (systemd/launchd/Task Scheduler)
+Each developer:
+1. Installs the extension
+2. Sets `vstunnel.relayUrl` to the shared relay
+3. Sets `vstunnel.userId` to their username
+
+The relay handles multiple users. Each user's phone only sees their own instances (token-authenticated).
 
 ---
 
-## Troubleshooting Deployments
+## Updating
 
-### Daemon Won't Start
+### Relay
+
 ```bash
-# Check Python version
-python3 --version  # Should be 3.8+
-
-# Check virtual environment
-source backend/venv/bin/activate
-python3 -c "import websockets; print(websockets.__version__)"
-
-# Check port availability
-lsof -i :8080  # Kill if needed: kill -9 <PID>
+docker stop vstunnel-relay
+docker rm vstunnel-relay
+# Rebuild with latest code:
+docker build -f relay/Dockerfile -t vstunnel-relay .
+docker run -d --name vstunnel-relay --restart unless-stopped -p 8080:8080 vstunnel-relay
 ```
 
-### Connection Timeout
-```bash
-# Verify tunnel is active in VS Code
-# Check firewall allows port 8080
-# Verify tunnel URL in mobile browser
+### Extension
 
-# Test from command line
-curl -v wss://your-tunnel.githubdev.dev
+```bash
+cd extension/
+npm run compile
+npx vsce package
+code --install-extension vstunnel-2.0.0.vsix --force
 ```
 
-### Memory Leak
-```bash
-# Monitor daemon memory usage
-watch -n 1 'ps aux | grep daemon.py'
-
-# Add memory limits (systemd)
-# In service file add:
-# MemoryMax=500M
-```
+Restart VS Code after updating.
 
 ---
 
-## Monitoring
+## Cost
 
-### Log Monitoring
-```bash
-# Real-time logs
-journalctl --user -u vstunnel -f
-
-# Last 50 lines
-journalctl --user -u vstunnel -n 50
-```
-
-### Health Check Script
-```bash
-#!/bin/bash
-# Check if daemon is responsive
-if nc -z localhost 8080; then
-    echo "✅ Daemon is running"
-else
-    echo "❌ Daemon is not responsive - restarting..."
-    systemctl --user restart vstunnel
-fi
-```
-
-### Uptime Monitoring
-```bash
-# Add to cron for periodic health checks
-*/5 * * * * /path/to/check-vstunnel-health.sh
-```
-
----
-
-## Migration & Updates
-
-### Backing Up Configuration
-```bash
-# Save tunnel URL and settings
-cp config/.env config/.env.backup
-```
-
-### Updating vstunnel
-```bash
-cd vstunnel
-
-# Fetch latest
-git pull origin main
-
-# Reinstall dependencies (in case of updates)
-source backend/venv/bin/activate
-pip install -r backend/requirements.txt --upgrade
-
-# Restart daemon
-systemctl --user restart vstunnel  # or your restart method
-```
-
-### Rollback
-```bash
-# Restore previous version
-git checkout <previous-commit>
-
-# Restart
-systemctl --user restart vstunnel
-```
-
----
-
-**Last Updated**: 2026-05-30
-**Version**: 1.0.0 Deployment Guide
+| Component | Spec | Monthly Cost |
+|-----------|------|-------------|
+| VM (relay) | t4g.small or equivalent | ~$12 (or $0 on existing infra) |
+| Storage | 20GB | ~$2 |
+| Data transfer | VPC internal | $0 |
+| Extension | Per laptop | $0 |
+| Mobile UI | Served by relay | $0 |
+| **Total** | | **$0 - $14/mo** |

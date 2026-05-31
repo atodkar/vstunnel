@@ -1,89 +1,126 @@
-<p align="center">
-  <img src="docs/assets/banner.png" alt="vstunnel" width="600" />
-</p>
+# vstunnel
 
-<h1 align="center">vstunnel</h1>
+**Remote Copilot Agent Monitor & Control**
 
-<p align="center">
-  <strong>Privacy-first mobile remote control for GitHub Copilot</strong>
-</p>
-
-<p align="center">
-  <a href="#quick-start">Quick Start</a> &middot;
-  <a href="docs/USER_GUIDE.md">User Guide</a> &middot;
-  <a href="docs/DEVELOPER_GUIDE.md">Developer Guide</a> &middot;
-  <a href="docs/ARCHITECTURE.md">Architecture</a> &middot;
-  <a href="CONTRIBUTING.md">Contributing</a>
-</p>
-
-<p align="center">
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT" /></a>
-  <img src="https://img.shields.io/badge/python-3.8%2B-blue.svg" alt="Python 3.8+" />
-  <img src="https://img.shields.io/badge/platform-linux%20%7C%20macos%20%7C%20windows-lightgrey.svg" alt="Platform" />
-  <img src="https://img.shields.io/badge/cost-%240%2Fmo-brightgreen.svg" alt="$0/mo" />
-</p>
+Monitor active GitHub Copilot sessions, review changes, accept/reject agent requests, and send follow-up prompts — all from your phone.
 
 ---
 
 ## The Problem
 
-You kick off a long Copilot generation, test suite, or AI agent on your laptop. You step away. The process stalls waiting for human approval — and you don't know until you're back at your desk.
+You start a Copilot agent task on your laptop and step away. The agent stalls waiting for approval, makes unwanted changes, or finishes without you knowing. You have no visibility until you're back at your desk.
 
 ## The Solution
 
-**vstunnel** is a lightweight companion that lets you monitor and send prompts to your desktop VS Code / Copilot session from any mobile browser. Your source code never leaves your machine.
+**vstunnel** is a VS Code extension + relay server that streams Copilot's activity to your phone in real time. You see every file it edits, every command it runs, and can approve, reject, or redirect it remotely.
 
 ```
-Phone  ──wss://──►  GitHub Tunnel  ──►  Local Daemon  ──►  VS Code Copilot
+Phone  ──wss://──>  Relay Server  <──wss://──  VS Code Extension (per instance)
 ```
 
 ---
 
-## Key Principles
+## Key Features
 
-| Principle | How |
-|---|---|
-| **Privacy-first** | Code never transits third-party servers. All traffic stays in your encrypted tunnel. |
-| **Zero cost** | Reuses VS Code's built-in tunnel infrastructure. No subscriptions, no cloud bills. |
-| **No native app** | Mobile UI is a static web page — no App Store, no install. |
-| **Minimal footprint** | One Python file, zero build step, two dependencies. |
+- **Activity Feed** — real-time stream of file edits, creates, deletes
+- **Diff Viewer** — see exactly what Copilot changed (colored unified diff)
+- **Prompt Injection** — send follow-up prompts into the active chat session
+- **Approval Control** — accept/reject agent requests from your phone
+- **Multi-Instance** — each VS Code window registers independently; switch between them on phone
+- **Privacy-first** — all traffic stays on your corporate VPN, no external services
 
 ---
 
 ## Quick Start
 
-### Prerequisites
-
-- Python 3.8+
-- VS Code (any recent version with built-in port forwarding)
-- A GitHub account (for tunnel auth)
-
-### 1. Clone & install
+### 1. Deploy the relay server (once, on a corporate VM)
 
 ```bash
-git clone https://github.com/atodkar/vstunnel.git
-cd vstunnel
-make setup        # or: ./scripts/setup.sh
+cd relay/
+docker build -f Dockerfile -t vstunnel-relay .
+docker run -d --name vstunnel-relay --restart unless-stopped -p 8080:8080 vstunnel-relay
+
+# Verify
+curl http://<vm-ip>:8080/health
 ```
 
-### 2. Start the daemon
+The relay also serves the mobile UI at `http://<vm-ip>:8080/`.
+
+### 2. Install the VS Code extension (on each developer laptop)
 
 ```bash
-make run          # or: ./scripts/start-daemon.sh
+cd extension/
+npm install
+npm run compile
+npx vsce package        # creates vstunnel-2.0.0.vsix
+code --install-extension vstunnel-2.0.0.vsix
 ```
 
-### 3. Expose via VS Code tunnel
+### 3. Configure the extension
 
-1. Open **VS Code** on your laptop.
-2. Open the **Ports** panel (`Ctrl+Shift+P` → "Ports: Focus on Ports View").
-3. Forward port **8080** and set visibility to **Public**.
-4. Copy the generated URL (e.g. `https://abcdef.githubdev.dev`).
+In VS Code Settings (`Ctrl+,`):
 
-### 4. Connect from your phone
+| Setting | Value | Description |
+|---------|-------|-------------|
+| `vstunnel.relayUrl` | `http://<vm-ip>:8080` | Relay server URL |
+| `vstunnel.userId` | `your-username` | Shown to phone clients |
+| `vstunnel.autoStart` | `true` | Start bridge on VS Code launch |
 
-1. Open the mobile UI — either locally (`frontend/index.html`) or your deployed URL.
-2. Paste the tunnel URL.
-3. Tap **Connect**. Start sending prompts.
+### 4. Start the bridge
+
+`Ctrl+Shift+P` → **"vstunnel: Start Mobile Bridge"**
+
+Output panel shows:
+```
+vstunnel: Connected to relay (http://<vm-ip>:8080)
+vstunnel: Registered as 'your-username'. Phone token: a1b2c3d4...
+```
+
+### 5. Connect from phone
+
+1. Open `http://<vm-ip>:8080` in your phone browser
+2. Select your username from the user list
+3. Enter the auth token from step 4
+4. Monitor activity, review diffs, send prompts
+
+---
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│ DEVELOPER LAPTOP                                                     │
+│                                                                      │
+│  ┌─ VS Code (my-react-app) ──────────────────────┐                 │
+│  │  Extension: CopilotMonitor + RelayClient       │                 │
+│  │  instance_id: inst_a1b2c3                      │──┐              │
+│  └────────────────────────────────────────────────┘  │              │
+│                                                      │ outbound     │
+│  ┌─ VS Code (backend-api) ───────────────────────┐  │ WebSocket    │
+│  │  Extension: CopilotMonitor + RelayClient       │──┤              │
+│  │  instance_id: inst_d4e5f6                      │  │              │
+│  └────────────────────────────────────────────────┘  │              │
+└──────────────────────────────────────────────────────┼──────────────┘
+                                                       │
+                                                       ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│ RELAY SERVER (corporate VM, Docker)                                    │
+│  - Groups instances by user_id                                        │
+│  - Buffers last 200 events per instance                               │
+│  - Forwards events to phones, commands to instances                   │
+│  - Serves mobile UI at /                                              │
+└──────────────────────────────────────────────────────────────────────┘
+                                                       │
+                                                       ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│ PHONE (mobile browser)                                                │
+│  [my-react-app] [backend-api]    ← workspace switcher                │
+│  [Activity] [Diff] [Prompt]      ← content tabs                      │
+│  [APPROVAL: "Run npm install?" [Accept] [Reject]]                    │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+All connections are **outbound** from the laptop. No firewall ports needed.
 
 ---
 
@@ -91,226 +128,86 @@ make run          # or: ./scripts/start-daemon.sh
 
 ```
 vstunnel/
-├── extension/               # VS Code Extension (recommended for users)
-│   ├── src/extension.ts     # Extension entry point
-│   ├── src/server.ts        # Embedded WebSocket server
-│   ├── src/views/           # Sidebar panels (status, history)
-│   └── package.json         # Extension manifest
-├── backend/                 # Standalone Python Daemon (alternative)
-│   ├── daemon.py            # Async WebSocket server + workspace detection
+├── extension/                 # VS Code Extension (primary)
+│   ├── src/extension.ts       # Activation, command dispatch
+│   ├── src/server.ts          # Local WebSocket server + event push
+│   ├── src/relay-client.ts    # Outbound relay connection
+│   ├── src/monitor/           # Copilot activity monitoring
+│   │   ├── types.ts           # Shared interfaces
+│   │   ├── file-tracker.ts    # File change detection
+│   │   ├── diff-generator.ts  # Git diff polling
+│   │   ├── prompt-injector.ts # Inject prompts into Copilot chat
+│   │   └── index.ts           # CopilotMonitor facade
+│   ├── src/views/             # Sidebar panels
+│   └── package.json           # Extension manifest + config schema
+├── relay/                     # Central Relay Server
+│   ├── server.py              # aiohttp WebSocket broker
+│   ├── Dockerfile             # Production container
+│   └── docker-compose.yml     # Quick deploy
+├── frontend/                  # Mobile Web UI (served by relay)
+│   ├── index.html             # Tab-based SPA
+│   ├── js/app.js              # WebSocket client + UI logic
+│   └── css/styles.css         # Dark mobile-first design
+├── backend/                   # Standalone Daemon (legacy/alternative)
+│   ├── daemon.py              # Python WebSocket server
 │   └── requirements.txt
-├── frontend/                # Mobile PWA
-│   ├── index.html           # SPA with workspace picker
-│   ├── css/styles.css       # Mobile-first responsive UI
-│   └── js/app.js            # WebSocket client + multi-instance support
-├── docs/
-│   ├── USER_GUIDE.md        # End-user step-by-step
-│   ├── DEVELOPER_GUIDE.md   # Developer onboarding
-│   ├── ARCHITECTURE.md      # Technical design
-│   ├── SCALING.md           # Scaling to many users
-│   └── DEPLOYMENT.md        # Production deployment
-├── Dockerfile
-├── docker-compose.yml
-├── Makefile
-├── CONTRIBUTING.md
-├── CHANGELOG.md
-└── LICENSE                   # MIT
+└── docs/
+    ├── ARCHITECTURE.md        # Technical design deep-dive
+    ├── DEVELOPER_GUIDE.md     # Build, test, contribute
+    ├── DEPLOYMENT.md          # Production deployment
+    └── RELAY_DEPLOYMENT.md    # Relay-specific setup
 ```
-
----
-
-## How It Works
-
-```
-┌──────────── INTERNET ───────────────────────────────────────────┐
-│                                                                   │
-│  [ Phone Browser ]                                               │
-│        │  wss://                                                  │
-│        ▼                                                         │
-│  [ GitHub Dev Tunnel ]  ◄── TLS 1.3, GitHub-authenticated       │
-│        │                                                         │
-└────────┼─────────────────────────────────────────────────────────┘
-         │
-┌────────▼──────── YOUR LAPTOP ────────────────────────────────────┐
-│                                                                   │
-│  [ vstunnel daemon ]  (localhost:8080)                           │
-│        │                                                         │
-│        │  subprocess: code --inline-chat "..."                   │
-│        ▼                                                         │
-│  [ VS Code + Copilot Extension ]                                │
-│                                                                   │
-└───────────────────────────────────────────────────────────────────┘
-```
-
-1. The **daemon** runs a WebSocket server on `localhost:8080`.
-2. VS Code's **port forwarding** wraps it in a public TLS URL.
-3. Your **phone** connects over `wss://` through that tunnel.
-4. Prompts arrive at the daemon, which calls the VS Code CLI.
-5. Status updates stream back to the phone in real time.
-
-Full technical breakdown: **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**
 
 ---
 
 ## Configuration
 
-Copy the example and edit as needed:
+### Extension Settings (VS Code)
 
-```bash
-cp config/.env.example config/.env
-```
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `vstunnel.relayUrl` | `""` | Relay server URL. When set, connects outbound. |
+| `vstunnel.userId` | system username | Your ID shown to phone clients |
+| `vstunnel.port` | `8080` | Local WebSocket port (direct mode) |
+| `vstunnel.autoStart` | `false` | Start bridge on VS Code launch |
+| `vstunnel.requireToken` | `true` | Require auth token for connections |
+
+### Relay Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `DAEMON_HOST` | `localhost` | Bind address |
-| `DAEMON_PORT` | `8080` | WebSocket listen port |
-| `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` |
-
----
-
-## Deployment Options
-
-| Method | Use Case | Guide |
-|--------|----------|-------|
-| **Local** | Personal dev machine | This README |
-| **Docker** | Isolated environment | `docker compose up` |
-| **systemd** | Linux always-on | [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md#systemd-service-linux) |
-| **launchd** | macOS always-on | [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md#launchagent-macos) |
-| **Vercel** | Host mobile UI publicly | [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md#cloud-deployment) |
-
----
-
-## Health Check
-
-The daemon exposes an HTTP health endpoint:
-
-```bash
-curl http://localhost:8080/health
-```
-
-```json
-{
-  "status": "healthy",
-  "version": "1.1.0",
-  "uptime": 3600,
-  "connected_clients": 1,
-  "vscode_available": true
-}
-```
+| `RELAY_PORT` | `8080` | Listen port |
+| `RELAY_HOST` | `0.0.0.0` | Bind address |
+| `LOG_LEVEL` | `INFO` | Logging level |
+| `FRONTEND_DIR` | `../frontend` | Path to mobile UI files |
 
 ---
 
 ## Security
 
-- All traffic encrypted via TLS (GitHub tunnel infrastructure).
-- Source code **never** leaves your machine — only prompts transit.
-- No telemetry, no analytics, no tracking.
-- Tunnel URLs are authenticated via your GitHub account.
-- Daemon binds to `localhost` only — not reachable without the tunnel.
-
-See [docs/ARCHITECTURE.md#security-model](docs/ARCHITECTURE.md#security-model) for threat analysis.
+- **Token auth**: Each extension instance gets a random token on registration. Phones must present it to connect.
+- **No data storage**: Relay only forwards messages. Nothing is persisted.
+- **Network isolation**: All traffic stays within corporate VPN.
+- **Per-user isolation**: A phone can only reach instances belonging to the authenticated user.
 
 ---
 
-## FAQ
+## Legacy: Standalone Daemon
 
-<details>
-<summary><strong>Is my source code exposed?</strong></summary>
-
-No. Only the prompt text you type on your phone travels through the tunnel. Your codebase stays on your machine.
-</details>
-
-<details>
-<summary><strong>What happens if the tunnel disconnects?</strong></summary>
-
-The mobile UI detects the drop and auto-reconnects. If the tunnel URL expired, regenerate it in VS Code's Ports panel.
-</details>
-
-<details>
-<summary><strong>Does this cost anything?</strong></summary>
-
-No. VS Code tunnels are free. The daemon runs on your existing hardware. The mobile UI can be hosted on any free static host.
-</details>
-
-<details>
-<summary><strong>Can multiple phones connect?</strong></summary>
-
-Yes. The daemon accepts multiple concurrent WebSocket connections.
-</details>
-
-<details>
-<summary><strong>Do I need GitHub Copilot?</strong></summary>
-
-Yes — the daemon triggers Copilot via VS Code's inline chat CLI. An active Copilot subscription is required.
-</details>
-
----
-
-## Two Ways to Run
-
-### Option A: VS Code Extension (Recommended for most users)
-
-One-click install, zero setup, auto-starts with VS Code:
+For environments where the extension can't be installed, the Python daemon still works:
 
 ```bash
-# Install from Marketplace (coming soon)
-code --install-extension vstunnel.vstunnel
-
-# Or build from source:
-cd extension
-npm install && npm run compile
+cd backend/
+pip install -r requirements.txt
+export RELAY_URL=http://<vm-ip>:8080
+export RELAY_USER_ID=your-username
+python3 daemon.py
 ```
 
-The extension:
-- Embeds the WebSocket server inside VS Code (no separate process)
-- Directly calls Copilot via the VS Code API (not CLI hacks)
-- Auto-forwards the port
-- Shows a QR code for instant mobile pairing
-- Handles multi-instance natively (one extension per window)
-- Supports token-based authentication
-
-### Option B: Standalone Python Daemon (Power users / self-hosters)
-
-For users who want full control or can't install extensions:
-
-```bash
-make setup && make run
-```
-
----
-
-## Scaling to Many Users
-
-vstunnel is designed to be **federated**: each user's laptop is its own server. This means:
-
-- **100 users = same infrastructure cost as 1 user ($0)**
-- Extension distributed via VS Code Marketplace (free)
-- Mobile UI hosted as static PWA on Vercel (free)
-- Optional pairing service for easy connection (~$5/mo for 50,000 users)
-
-See **[docs/SCALING.md](docs/SCALING.md)** for the full scaling architecture, revenue model, and implementation roadmap.
-
----
-
-## Contributing
-
-We welcome contributions of all kinds. Please read **[CONTRIBUTING.md](CONTRIBUTING.md)** before submitting a PR.
-
-**Good first issues:**
-- Improve mobile UI accessibility
-- Add unit tests for the daemon
-- Support alternative VS Code forks (Cursor, VSCodium)
-- Add i18n to the frontend
-- Help publish the extension to the Marketplace
+This connects to the relay the same way but uses process detection + CLI for VS Code interaction (less reliable than the extension approach).
 
 ---
 
 ## License
 
-[MIT](LICENSE) — free for personal and commercial use.
-
----
-
-<p align="center">
-  Built for developers who code from everywhere.
-</p>
+[MIT](LICENSE)
